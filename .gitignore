@@ -6,6 +6,12 @@
 # Build output (build.sh)
 dist/
 
+# Local code-signing keychain password
+.signing/
+
+# swiftc temporary files
+.tmp/
+
 # Swift / Xcode
 .build/
 .swiftpm/

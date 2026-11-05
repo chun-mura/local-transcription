@@ -10,7 +10,6 @@ final class FormatConverter: @unchecked Sendable {
     private var sameRateKey: String?
     private var outputConverter: AVAudioConverter?
     private var fedSeconds: Double = 0
-    private var produced = false
     private var forceDecimation = false
     private let lock = NSLock()
 
@@ -32,8 +31,9 @@ final class FormatConverter: @unchecked Sendable {
 
     func convert(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         guard input.frameLength > 0 else { return nil }
-        if sameFormat(input.format, output) {
-            return input
+        let source = standardFloat(input) ?? input
+        if sameFormat(source.format, output) {
+            return source
         }
 
         lock.lock()
@@ -41,45 +41,66 @@ final class FormatConverter: @unchecked Sendable {
         lock.unlock()
 
         if decimate {
-            return decimated(input)
+            return decimated(source)
         }
 
-        guard let converted = convertWithRateConverter(input) else { return nil }
-        if converted.frameLength > 0 {
-            lock.lock()
-            produced = true
-            lock.unlock()
+        switch convertWithRateConverter(source) {
+        case .produced(let converted):
+            noteProduced()
             return converted
+        case .starved:
+            return stall(source)
+        case .failed:
+            invalidateRateConverter()
+            if case .produced(let converted) = convertWithRateConverter(source) {
+                noteProduced()
+                return converted
+            }
+            invalidateRateConverter()
+            return stall(source)
         }
+    }
 
+    private func noteProduced() {
         lock.lock()
-        fedSeconds += Double(input.frameLength) / input.format.sampleRate
-        let stalled = fedSeconds > 0.5 && !produced
-        if stalled {
+        fedSeconds = 0
+        lock.unlock()
+    }
+
+    private func stall(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        lock.lock()
+        fedSeconds += Double(source.frameLength) / source.format.sampleRate
+        let giveUp = fedSeconds > 0.5
+        if giveUp {
             forceDecimation = true
             rateConverter = nil
             rateConverterKey = nil
         }
         lock.unlock()
-
-        if stalled {
-            return decimated(input)
+        if giveUp {
+            return decimated(source)
         }
         return nil
     }
 
-    private func convertWithRateConverter(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    private func invalidateRateConverter() {
+        lock.lock()
+        rateConverter = nil
+        rateConverterKey = nil
+        lock.unlock()
+    }
+
+    private func convertWithRateConverter(_ input: AVAudioPCMBuffer) -> Conversion {
         let key = formatKey(input.format)
         lock.lock()
-        if rateConverterKey != key {
+        let reusable = rateConverterKey == key && rateConverter?.inputFormat.isEqual(input.format) == true
+        if !reusable {
             rateConverter = makeConverter(from: input.format, to: output)
             rateConverterKey = key
-            fedSeconds = 0
-            produced = false
         }
         let converter = rateConverter
         lock.unlock()
-        guard let converter else { return nil }
+        guard let converter else { return .failed }
         return pull(converter, input: input, output: output)
     }
 
@@ -87,7 +108,8 @@ final class FormatConverter: @unchecked Sendable {
         let ratio = input.format.sampleRate / output.sampleRate
         let step = Int(ratio.rounded())
         guard step >= 1, abs(Double(step) - ratio) < 0.01 else {
-            return convertWithRateConverter(input)
+            guard case .produced(let converted) = convertWithRateConverter(input) else { return nil }
+            return converted
         }
         if step == 1 {
             return convertSameRate(input, to: output)
@@ -114,7 +136,100 @@ final class FormatConverter: @unchecked Sendable {
         return convertSameRate(paced, to: output)
     }
 
+    /// 24bit など変換器が受け付けない整数を、同じサンプルレートの Float32 にする。
+    /// Studio 24c は 4 バイトに収めた 24bit で届き、形式の細部がバッファごとに違う。
+    private func standardFloat(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard input.format.commonFormat == .otherFormat else { return nil }
+        let asbd = input.format.streamDescription.pointee
+        guard asbd.mFormatID == kAudioFormatLinearPCM,
+              asbd.mFormatFlags & kAudioFormatFlagIsFloat == 0,
+              asbd.mBitsPerChannel == 24
+        else { return nil }
+        let channels = Int(asbd.mChannelsPerFrame)
+        let frames = Int(input.frameLength)
+        guard channels > 0, frames > 0 else { return nil }
+        let nonInterleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        let bytesPerFrame = Int(asbd.mBytesPerFrame)
+        let bytesPerSample = nonInterleaved ? bytesPerFrame : bytesPerFrame / channels
+        guard bytesPerSample == 3 || bytesPerSample == 4 else { return nil }
+        let highAligned = asbd.mFormatFlags & kAudioFormatFlagIsAlignedHigh != 0
+        let bigEndian = asbd.mFormatFlags & kAudioFormatFlagIsBigEndian != 0
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: asbd.mSampleRate,
+            channels: AVAudioChannelCount(channels),
+            interleaved: false
+        ), let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: input.frameLength),
+           let destination = buffer.floatChannelData
+        else { return nil }
+        buffer.frameLength = input.frameLength
+        let lists = UnsafeMutableAudioBufferListPointer(input.mutableAudioBufferList)
+        if nonInterleaved {
+            guard lists.count >= channels else { return nil }
+            for channel in 0..<channels {
+                guard let data = lists[channel].mData else { return nil }
+                let samples = destination[channel]
+                for frame in 0..<frames {
+                    samples[frame] = decode24(
+                        data,
+                        sampleIndex: frame,
+                        bytesPerSample: bytesPerSample,
+                        highAligned: highAligned,
+                        bigEndian: bigEndian
+                    )
+                }
+            }
+        } else {
+            guard let data = lists.first?.mData else { return nil }
+            for frame in 0..<frames {
+                for channel in 0..<channels {
+                    destination[channel][frame] = decode24(
+                        data,
+                        sampleIndex: frame * channels + channel,
+                        bytesPerSample: bytesPerSample,
+                        highAligned: highAligned,
+                        bigEndian: bigEndian
+                    )
+                }
+            }
+        }
+        return buffer
+    }
+
+    private func decode24(
+        _ data: UnsafeMutableRawPointer,
+        sampleIndex: Int,
+        bytesPerSample: Int,
+        highAligned: Bool,
+        bigEndian: Bool
+    ) -> Float {
+        if bytesPerSample == 4 {
+            var word = data.load(fromByteOffset: sampleIndex * 4, as: Int32.self)
+            if bigEndian {
+                word = Int32(bigEndian: word)
+            }
+            if highAligned {
+                return Float(word) / 2_147_483_648
+            }
+            var value = word & 0x00FF_FFFF
+            if value >= 0x0080_0000 {
+                value -= 0x0100_0000
+            }
+            return Float(value) / 8_388_608
+        }
+        let offset = sampleIndex * 3
+        let b0 = Int32(data.load(fromByteOffset: offset, as: UInt8.self))
+        let b1 = Int32(data.load(fromByteOffset: offset + 1, as: UInt8.self))
+        let b2 = Int32(data.load(fromByteOffset: offset + 2, as: UInt8.self))
+        var value = bigEndian ? (b0 << 16) | (b1 << 8) | b2 : b0 | (b1 << 8) | (b2 << 16)
+        if value >= 0x0080_0000 {
+            value -= 0x0100_0000
+        }
+        return Float(value) / 8_388_608
+    }
+
     private func mixToFloat(_ input: AVAudioPCMBuffer) -> [Float]? {
+        let input = standardFloat(input) ?? input
         let frames = Int(input.frameLength)
         let channels = Int(input.format.channelCount)
         guard frames > 0, channels > 0 else { return nil }
@@ -185,7 +300,8 @@ final class FormatConverter: @unchecked Sendable {
         let converter = sameRateConverter
         lock.unlock()
         guard let converter else { return nil }
-        return pull(converter, input: input, output: output)
+        guard case .produced(let buffer) = pull(converter, input: input, output: output) else { return nil }
+        return buffer
     }
 
     private func makeConverter(from input: AVAudioFormat, to output: AVAudioFormat) -> AVAudioConverter? {
@@ -197,10 +313,10 @@ final class FormatConverter: @unchecked Sendable {
         return converter
     }
 
-    private func pull(_ converter: AVAudioConverter, input: AVAudioPCMBuffer, output: AVAudioFormat) -> AVAudioPCMBuffer? {
+    private func pull(_ converter: AVAudioConverter, input: AVAudioPCMBuffer, output: AVAudioFormat) -> Conversion {
         let ratio = output.sampleRate / input.format.sampleRate
         let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * max(ratio, 1))) + 32
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: output, frameCapacity: capacity) else { return nil }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: output, frameCapacity: capacity) else { return .failed }
         var consumed = false
         var error: NSError?
         let status = converter.convert(to: buffer, error: &error) { _, outStatus in
@@ -213,9 +329,12 @@ final class FormatConverter: @unchecked Sendable {
             return input
         }
         if status == .error || error != nil {
-            return nil
+            return .failed
         }
-        return buffer.frameLength > 0 ? buffer : nil
+        if buffer.frameLength == 0 {
+            return .starved
+        }
+        return .produced(buffer)
     }
 
     private func sameFormat(_ lhs: AVAudioFormat, _ rhs: AVAudioFormat) -> Bool {
@@ -226,8 +345,16 @@ final class FormatConverter: @unchecked Sendable {
     }
 
     private func formatKey(_ format: AVAudioFormat) -> String {
-        "\(format.sampleRate)-\(format.channelCount)-\(format.commonFormat.rawValue)-\(format.isInterleaved)"
+        let asbd = format.streamDescription.pointee
+        let layout = format.channelLayout?.layoutTag ?? 0
+        return "\(asbd.mSampleRate)-\(asbd.mFormatID)-\(asbd.mFormatFlags)-\(asbd.mBytesPerPacket)-\(asbd.mFramesPerPacket)-\(asbd.mBytesPerFrame)-\(asbd.mChannelsPerFrame)-\(asbd.mBitsPerChannel)-\(layout)"
     }
+}
+
+private enum Conversion {
+    case produced(AVAudioPCMBuffer)
+    case starved
+    case failed
 }
 
 enum AudioBuffers {

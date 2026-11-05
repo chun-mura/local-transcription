@@ -3,6 +3,7 @@ import AVFoundation
 import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
+import ScreenCaptureKit
 import Speech
 
 enum PermissionTarget: Sendable {
@@ -140,6 +141,19 @@ actor Engine {
         guard active else { return }
         let directory = await teardown()
         await deliver(directory, status: "停止中")
+    }
+
+    func reset(save: Bool) async -> Bool {
+        guard active, !busy, !rotating, !awaitingTitle else { return false }
+        busy = true
+        defer { busy = false }
+        generation += 1
+        limitTask?.cancel()
+        _ = await teardown(discard: !save)
+        if !save {
+            hooks.path(nil)
+        }
+        return true
     }
 
     private func startSession(locale: Locale, format: AVAudioFormat, token: Int) async throws {
@@ -288,14 +302,18 @@ actor Engine {
     }
 
     @discardableResult
-    private func teardown(updateUI: Bool = true) async -> URL? {
+    private func teardown(updateUI: Bool = true, discard: Bool = false) async -> URL? {
         let directory = store?.directory
         active = false
         limitTask?.cancel()
         await capture.stop()
         await system?.finish()
         await microphone?.finish()
-        store?.close()
+        if discard {
+            store?.discard()
+        } else {
+            store?.close()
+        }
         router.clear()
         store = nil
         system = nil
@@ -303,7 +321,7 @@ actor Engine {
         if updateUI {
             hooks.running(false)
         }
-        return directory
+        return discard ? nil : directory
     }
 
     private func deliver(_ directory: URL?, status: String) async {
@@ -337,10 +355,14 @@ actor Engine {
         default:
             throw EngineError.microphoneDenied
         }
-        if !CGPreflightScreenCaptureAccess() {
-            if !CGRequestScreenCaptureAccess() {
-                throw EngineError.screenDenied
-            }
+        // CGPreflight / CGRequest は最近の macOS で偽陰性・ダイアログ不出になりやすい。
+        // ScreenCaptureKit 本体と同じ SCShareableContent で確かめる。
+        if CGPreflightScreenCaptureAccess() { return }
+        do {
+            _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        } catch {
+            let detail = (error as NSError).localizedDescription
+            throw EngineError.screenDenied(detail)
         }
     }
 }
@@ -378,9 +400,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let seal = SealDot()
     private var sessionPath: String?
     private var permissionTarget: PermissionTarget?
+    private let resetButton = StampButton()
+    private let displayGate = DisplayGate()
     private var running = false
     private var preparing = false
     private var naming = false
+    private var resetting = false
+    private var askingReset = false
     private var recordings: RecordingsController?
 
     override init() {
@@ -418,11 +444,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hooks.status = { [weak self] text in
             Task { @MainActor in self?.statusLabel.stringValue = text }
         }
-        hooks.line = { [weak self] line in
-            Task { @MainActor in self?.appendLine(line) }
+        hooks.line = { [weak self, displayGate] line in
+            let generation = displayGate.current()
+            Task { @MainActor in
+                guard let self, displayGate.current() == generation else { return }
+                self.appendLine(line)
+            }
         }
-        hooks.volatile = { [weak self] speaker, text in
-            Task { @MainActor in self?.setVolatile(speaker, text) }
+        hooks.volatile = { [weak self, displayGate] speaker, text in
+            let generation = displayGate.current()
+            Task { @MainActor in
+                guard let self, displayGate.current() == generation else { return }
+                self.setVolatile(speaker, text)
+            }
         }
         hooks.path = { [weak self] path in
             Task { @MainActor in
@@ -468,8 +502,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func refreshStartButton() {
-        if naming {
-            startButton.title = "停止"
+        let locked = naming || resetting || askingReset
+        if locked {
+            startButton.title = running ? "停止" : "開始"
             startButton.isEnabled = false
         } else if preparing && !running {
             startButton.title = "準備中"
@@ -482,6 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             startButton.isEnabled = true
         }
         startButton.toolTip = "⌘⇧R"
+        resetButton.isEnabled = running && !locked && !preparing
     }
 
     @objc func toggleRecording(_ sender: Any?) {
@@ -494,7 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let alert = NSAlert()
         alert.messageText = "録音を止めて終了しますか"
-        alert.informativeText = "ここまでの文字と音声は保存されます。"
+        alert.informativeText = "止めたあと、保存するか消せます。"
         alert.addButton(withTitle: "止めて終了")
         alert.addButton(withTitle: "録音を続ける")
         alert.beginSheetModal(for: sender) { [weak self] response in
@@ -514,6 +550,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         toggle.keyEquivalentModifierMask = [.command, .shift]
         toggle.target = self
         appMenu.addItem(toggle)
+        let reset = NSMenuItem(title: "録音をリセット", action: #selector(resetRecording(_:)), keyEquivalent: "")
+        reset.target = self
+        appMenu.addItem(reset)
         let archive = NSMenuItem(title: "これまでの記録", action: #selector(showRecordingsMenu(_:)), keyEquivalent: "")
         archive.target = self
         appMenu.addItem(archive)
@@ -536,8 +575,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    @objc private func resetRecording(_ sender: Any?) {
+        pressReset()
+    }
+
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(resetRecording(_:)) {
+            return running && !naming && !resetting && !askingReset && !preparing
+        }
+        return true
+    }
+
     private func pressStart() {
-        guard !naming else { return }
+        guard !naming, !resetting, !askingReset else { return }
         Task {
             if running {
                 await engine.stop()
@@ -545,6 +595,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 await engine.start()
             }
         }
+    }
+
+    private func pressReset() {
+        guard running, !naming, !resetting, !askingReset, !preparing, let window else { return }
+        askingReset = true
+        refreshStartButton()
+        let alert = NSAlert()
+        alert.messageText = "ここまでの録音をリセットしますか"
+        alert.informativeText = "保存すると文字と音声を残します。保存しないと消します。どちらも録音は止まり、画面は空になります。"
+        alert.addButton(withTitle: "保存してリセット")
+        alert.addButton(withTitle: "保存せずリセット")
+        alert.addButton(withTitle: "キャンセル")
+        alert.buttons[2].keyEquivalent = "\u{1b}"
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            switch response {
+            case .alertFirstButtonReturn, .alertSecondButtonReturn:
+                self.resetting = true
+                self.askingReset = false
+                self.refreshStartButton()
+                let save = response == .alertFirstButtonReturn
+                Task { @MainActor in
+                    await self.performReset(save: save)
+                }
+            default:
+                self.askingReset = false
+                self.refreshStartButton()
+            }
+        }
+    }
+
+    private func performReset(save: Bool) async {
+        resetting = true
+        refreshStartButton()
+        let did = await engine.reset(save: save)
+        if did {
+            displayGate.bump()
+            running = false
+            seal.active = false
+            clearTranscript()
+            if save {
+                statusLabel.stringValue = "ここまでを保存しました"
+                let kept = sessionPath.map { URL(fileURLWithPath: $0) }
+                recordings?.reload(selecting: kept)
+            } else {
+                sessionPath = nil
+                pathLabel.stringValue = ""
+                refreshSideButton()
+                recordings?.reload(selecting: nil)
+                statusLabel.stringValue = "保存せずにリセットしました"
+            }
+        }
+        resetting = false
+        refreshStartButton()
     }
 
     private func offerTitle(for directory: URL) async {
@@ -556,25 +660,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         NSApp.activate()
         window?.makeKeyAndOrderFront(nil)
-        let entered = await askTitle(existing: SessionCatalog.title(in: directory))
-        do {
-            let renamed = try SessionCatalog.apply(title: entered, to: directory)
+        switch await askTitle(existing: SessionCatalog.title(in: directory)) {
+        case .keep(let entered):
+            do {
+                let renamed = try SessionCatalog.apply(title: entered, to: directory)
+                if samePath(sessionPath, directory.path) {
+                    sessionPath = renamed.path
+                    pathLabel.stringValue = renamed.path
+                    refreshSideButton()
+                }
+                recordings?.reload(selecting: renamed)
+            } catch {
+                statusLabel.stringValue = "名前を付けられませんでした"
+            }
+        case .discard:
+            do {
+                try FileManager.default.removeItem(at: directory)
+            } catch {
+                statusLabel.stringValue = "録音を消せませんでした"
+                recordings?.reload(selecting: directory)
+                return
+            }
             if samePath(sessionPath, directory.path) {
-                sessionPath = renamed.path
-                pathLabel.stringValue = renamed.path
+                sessionPath = nil
+                pathLabel.stringValue = ""
                 refreshSideButton()
             }
-            recordings?.reload(selecting: renamed)
-        } catch {
-            statusLabel.stringValue = "名前を付けられませんでした"
+            displayGate.bump()
+            clearTranscript()
+            recordings?.reload(selecting: nil)
+            statusLabel.stringValue = "保存せずに閉じました"
         }
     }
 
-    private func askTitle(existing: String) async -> String {
+    private func askTitle(existing: String) async -> TitleChoice {
         let alert = NSAlert()
         alert.messageText = "この録音の名前"
-        alert.informativeText = "空のまま保存できます。あとから一覧で変えられます。"
+        alert.informativeText = "空のまま保存できます。保存しないと消して閉じます。"
         alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "保存しない")
+        alert.buttons[1].keyEquivalent = "\u{1b}"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         field.stringValue = existing
         field.placeholderString = "企画定例"
@@ -582,12 +707,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
         guard let window else {
-            alert.runModal()
-            return field.stringValue
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                return .keep(field.stringValue)
+            }
+            return .discard
         }
         return await withCheckedContinuation { continuation in
-            alert.beginSheetModal(for: window) { _ in
-                continuation.resume(returning: field.stringValue)
+            alert.beginSheetModal(for: window) { response in
+                if response == .alertFirstButtonReturn {
+                    continuation.resume(returning: .keep(field.stringValue))
+                } else {
+                    continuation.resume(returning: .discard)
+                }
             }
         }
     }
@@ -644,6 +776,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             .foregroundColor: spoken
         ]))
         field.attributedStringValue = line
+    }
+
+    private func clearTranscript() {
+        textView.string = ""
+        setVolatile(.system, "")
+        setVolatile(.microphone, "")
+        updateLatestButton()
     }
 
     private func appendLine(_ line: String) {
@@ -737,7 +876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.backgroundColor = Ink.paper
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.minSize = NSSize(width: 560, height: 480)
+        window.minSize = NSSize(width: 640, height: 480)
         window.center()
 
         guard let content = window.contentView else { return window }
@@ -775,9 +914,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordsButton.title = "記録"
         recordsButton.filled = false
         recordsButton.toolTip = "これまでの記録"
+        resetButton.title = "リセット"
+        resetButton.filled = false
+        resetButton.isEnabled = false
+        resetButton.toolTip = "途中までの録音を空にする"
         startButton.onPress = { [weak self] in self?.pressStart() }
         sideButton.onPress = { [weak self] in self?.pressSide() }
         recordsButton.onPress = { [weak self] in self?.showRecordings() }
+        resetButton.onPress = { [weak self] in self?.pressReset() }
         latestButton.title = "最新へ"
         latestButton.filled = false
         latestButton.isHidden = true
@@ -826,7 +970,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             object: scrollView.contentView
         )
 
-        let views = [title, seal, statusLabel, recordsButton, sideButton, startButton, sheet, margin, opponentLine, selfLine, scrollView, latestButton, hint, pathLabel]
+        let views = [title, seal, statusLabel, resetButton, recordsButton, sideButton, startButton, sheet, margin, opponentLine, selfLine, scrollView, latestButton, hint, pathLabel]
         for view in views {
             view.translatesAutoresizingMaskIntoConstraints = false
             if view === margin || view === opponentLine || view === selfLine || view === scrollView || view === latestButton {
@@ -860,6 +1004,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             recordsButton.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             recordsButton.widthAnchor.constraint(equalToConstant: 72),
             recordsButton.heightAnchor.constraint(equalToConstant: 34),
+
+            resetButton.trailingAnchor.constraint(equalTo: recordsButton.leadingAnchor, constant: -8),
+            resetButton.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            resetButton.widthAnchor.constraint(equalToConstant: 96),
+            resetButton.heightAnchor.constraint(equalToConstant: 34),
 
             statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
             statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
@@ -925,6 +1074,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let priority = NSLayoutConstraint.Priority.defaultLow
         view.setContentCompressionResistancePriority(priority, for: .horizontal)
         view.setContentHuggingPriority(priority, for: .horizontal)
+    }
+}
+
+private enum TitleChoice {
+    case keep(String)
+    case discard
+}
+
+final class DisplayGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation = 0
+
+    func current() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation
+    }
+
+    func bump() {
+        lock.lock()
+        generation += 1
+        lock.unlock()
     }
 }
 
@@ -1257,7 +1428,7 @@ final class StampButton: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let rect = pressed ? bounds.offsetBy(dx: 1, dy: -1) : bounds
         let fill = filled ? (isEnabled ? Ink.ink : Ink.lift) : Ink.lift
-        let foreground = filled ? (isEnabled ? Ink.paper : Ink.faint) : Ink.ink
+        let foreground = isEnabled ? (filled ? Ink.paper : Ink.ink) : Ink.faint
         fill.setFill()
         rect.fill()
         let paragraph = NSMutableParagraphStyle()

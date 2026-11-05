@@ -141,7 +141,7 @@ final class LiveChannel: @unchecked Sendable {
 
 enum EngineError: LocalizedError {
     case microphoneDenied
-    case screenDenied
+    case screenDenied(String)
     case japaneseUnavailable
     case modelUnsupported
     case modelNotInstalled
@@ -152,21 +152,22 @@ enum EngineError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .microphoneDenied:
-            "マイクの使用が許可されていません。システム設定の「マイク」でこのアプリを許可してください。"
-        case .screenDenied:
-            "画面収録が許可されていません。システム設定の「画面収録とシステムオーディオ録音」でこのアプリを許可してから、もう一度開いてください。"
+            return "マイクの使用が許可されていません。システム設定の「マイク」でこのアプリを許可してください。"
+        case .screenDenied(let detail):
+            let base = "画面収録が許可されていません。システム設定の「画面収録とシステムオーディオ録音」でこのアプリを許可してから、もう一度開いてください。"
+            return detail.isEmpty ? base : "\(base)（\(detail)）"
         case .japaneseUnavailable:
-            "このMacでは日本語の音声認識が使えません。"
+            return "このMacでは日本語の音声認識が使えません。"
         case .modelUnsupported:
-            "日本語の認識モデルがこのMacに対応していません。"
+            return "日本語の認識モデルがこのMacに対応していません。"
         case .modelNotInstalled:
-            "日本語の認識モデルを導入できませんでした。"
+            return "日本語の認識モデルを導入できませんでした。"
         case .formatUnavailable:
-            "認識に渡す音声形式が見つかりませんでした。"
+            return "認識に渡す音声形式が見つかりませんでした。"
         case .noDisplay:
-            "取り込みに使うディスプレイが見つかりませんでした。"
+            return "取り込みに使うディスプレイが見つかりませんでした。"
         case .captureFailed(let detail):
-            "音の取り込みを開始できませんでした。\(detail)"
+            return "音の取り込みを開始できませんでした。\(detail)"
         }
     }
 }

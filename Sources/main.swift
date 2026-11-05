@@ -408,6 +408,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var resetting = false
     private var askingReset = false
     private var recordings: RecordingsController?
+    private var titleQueue = TitlePromptQueue()
+    private var presentingTitle = false
+    private var closeAfterTitle = false
+    private let deferredTitleStatus = "保存しました。名前は戻ってから付けます"
 
     override init() {
         engine = Engine(hooks: hooks)
@@ -426,6 +430,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { await presentPendingTitles() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -477,13 +485,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         hooks.running = { [weak self] running in
             Task { @MainActor in
-                self?.running = running
-                self?.seal.active = running
-                self?.refreshStartButton()
-                self?.recordings?.noteActivityChanged()
+                guard let self else { return }
+                self.running = running
+                self.seal.active = running
+                self.refreshStartButton()
+                self.recordings?.noteActivityChanged()
                 if !running {
-                    self?.setVolatile(.system, "")
-                    self?.setVolatile(.microphone, "")
+                    self.setVolatile(.system, "")
+                    self.setVolatile(.microphone, "")
+                    await self.presentPendingTitles()
                 }
             }
         }
@@ -495,7 +505,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         hooks.finish = { [weak self] url, done in
             Task { @MainActor in
-                await self?.offerTitle(for: url)
+                guard let self else {
+                    done()
+                    return
+                }
+                self.titleQueue.add(url.path)
+                if self.titlePrompt().asksNow {
+                    await self.presentPendingTitles()
+                } else if !NSApp.isActive {
+                    self.noteDeferredTitle()
+                }
                 done()
             }
         }
@@ -525,7 +544,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if closingAfterStop || !running {
+        if closingAfterStop {
+            return true
+        }
+        if !running && presentingTitle {
+            closeAfterTitle = true
+            return false
+        }
+        if !running && !titleQueue.paths.isEmpty && titlePrompt().asksNow {
+            closeAfterTitle = true
+            Task { await presentPendingTitles() }
+            return false
+        }
+        if !running {
             return true
         }
         let alert = NSAlert()
@@ -651,16 +682,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshStartButton()
     }
 
-    private func offerTitle(for directory: URL) async {
+    private func titlePrompt() -> TitlePrompt {
+        TitlePrompt(
+            appActive: NSApp.isActive,
+            recording: running,
+            preparing: preparing,
+            resetting: resetting,
+            askingReset: askingReset
+        )
+    }
+
+    private func noteDeferredTitle() {
+        guard !running, !preparing else { return }
+        statusLabel.stringValue = deferredTitleStatus
+    }
+
+    private func presentPendingTitles() async {
+        guard !presentingTitle else { return }
+        guard titlePrompt().asksNow, window != nil else {
+            closeAfterTitle = false
+            return
+        }
+        presentingTitle = true
         naming = true
         refreshStartButton()
         defer {
+            presentingTitle = false
             naming = false
             refreshStartButton()
+            if closeAfterTitle, titleQueue.paths.isEmpty {
+                closeAfterTitle = false
+                closingAfterStop = true
+                window?.close()
+            }
         }
-        NSApp.activate()
         window?.makeKeyAndOrderFront(nil)
-        switch await askTitle(existing: SessionCatalog.title(in: directory)) {
+        while window != nil, let path = titleQueue.next(when: titlePrompt()) {
+            await resolveTitle(for: URL(fileURLWithPath: path))
+        }
+        if !running, !preparing, statusLabel.stringValue == deferredTitleStatus {
+            statusLabel.stringValue = "停止中"
+        }
+    }
+
+    private func resolveTitle(for directory: URL) async {
+        guard let choice = await askTitle(existing: SessionCatalog.title(in: directory)) else { return }
+        switch choice {
         case .keep(let entered):
             do {
                 let renamed = try SessionCatalog.apply(title: entered, to: directory)
@@ -681,19 +748,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 recordings?.reload(selecting: directory)
                 return
             }
-            if samePath(sessionPath, directory.path) {
+            let current = samePath(sessionPath, directory.path)
+            if current {
                 sessionPath = nil
                 pathLabel.stringValue = ""
                 refreshSideButton()
+                displayGate.bump()
+                clearTranscript()
+                statusLabel.stringValue = "保存せずに閉じました"
             }
-            displayGate.bump()
-            clearTranscript()
-            recordings?.reload(selecting: nil)
-            statusLabel.stringValue = "保存せずに閉じました"
+            let kept = current ? nil : sessionPath.map { URL(fileURLWithPath: $0) }
+            recordings?.reload(selecting: kept)
         }
     }
 
-    private func askTitle(existing: String) async -> TitleChoice {
+    private func askTitle(existing: String) async -> TitleChoice? {
         let alert = NSAlert()
         alert.messageText = "この録音の名前"
         alert.informativeText = "空のまま保存できます。保存しないと消して閉じます。"
@@ -706,13 +775,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         field.font = Face.sans(14)
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
-        guard let window else {
-            let response = alert.runModal()
-            if response == .alertFirstButtonReturn {
-                return .keep(field.stringValue)
-            }
-            return .discard
-        }
+        guard let window else { return nil }
         return await withCheckedContinuation { continuation in
             alert.beginSheetModal(for: window) { response in
                 if response == .alertFirstButtonReturn {

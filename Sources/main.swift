@@ -142,7 +142,7 @@ actor Engine {
         limitTask?.cancel()
         guard active else { return }
         let directory = await teardown()
-        await deliver(directory, status: "停止中")
+        await deliver(directory, status: "保存しました")
     }
 
     func reset(save: Bool) async -> Bool {
@@ -209,7 +209,7 @@ actor Engine {
             self.microphone = nil
             hooks.path(directory.path)
             hooks.running(false)
-            await deliver(directory, status: "停止中")
+            await deliver(directory, status: "保存しました")
             return
         }
 
@@ -567,7 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let alert = NSAlert()
         alert.messageText = "録音を止めて終了しますか"
-        alert.informativeText = "止めたあと、保存するか消せます。"
+        alert.informativeText = "止めると保存して終了します。"
         alert.addButton(withTitle: "止めて終了")
         alert.addButton(withTitle: "録音を続ける")
         alert.beginSheetModal(for: sender) { [weak self] response in
@@ -730,53 +730,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             await resolveTitle(for: URL(fileURLWithPath: path))
         }
         if !running, !preparing, statusLabel.stringValue == deferredTitleStatus {
-            statusLabel.stringValue = "停止中"
+            statusLabel.stringValue = "保存しました"
         }
     }
 
     private func resolveTitle(for directory: URL) async {
-        guard let choice = await askTitle(existing: SessionCatalog.title(in: directory)) else { return }
-        switch choice {
-        case .keep(let entered):
-            do {
-                let renamed = try SessionCatalog.apply(title: entered, to: directory)
-                if samePath(sessionPath, directory.path) {
-                    sessionPath = renamed.path
-                    pathLabel.stringValue = renamed.path
-                    refreshSideButton()
-                }
-                recordings?.reload(selecting: renamed)
-            } catch {
-                statusLabel.stringValue = "名前を付けられませんでした"
-            }
-        case .discard:
-            do {
-                try FileManager.default.removeItem(at: directory)
-            } catch {
-                statusLabel.stringValue = "録音を消せませんでした"
-                recordings?.reload(selecting: directory)
-                return
-            }
-            let current = samePath(sessionPath, directory.path)
-            if current {
-                sessionPath = nil
-                pathLabel.stringValue = ""
+        guard case .name(let entered) = await askTitle(existing: SessionCatalog.title(in: directory)) else { return }
+        do {
+            let renamed = try SessionCatalog.apply(title: entered, to: directory)
+            if samePath(sessionPath, directory.path) {
+                sessionPath = renamed.path
+                pathLabel.stringValue = renamed.path
                 refreshSideButton()
-                displayGate.bump()
-                clearTranscript()
-                statusLabel.stringValue = "保存せずに閉じました"
             }
-            let kept = current ? nil : sessionPath.map { URL(fileURLWithPath: $0) }
-            recordings?.reload(selecting: kept)
+            recordings?.reload(selecting: renamed)
+        } catch {
+            statusLabel.stringValue = "名前を付けられませんでした"
         }
     }
 
     private func askTitle(existing: String) async -> TitleChoice? {
         let alert = NSAlert()
         alert.messageText = "この録音の名前"
-        alert.informativeText = "空のまま保存できます。保存しないと消して閉じます。"
-        alert.addButton(withTitle: "保存")
-        alert.addButton(withTitle: "保存しない")
+        alert.informativeText = "保存してあります。閉じても残ります。名前は空欄でも、あとから付けられます。"
+        alert.addButton(withTitle: "付ける")
+        alert.addButton(withTitle: "閉じる")
         alert.buttons[1].keyEquivalent = "\u{1b}"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         field.stringValue = existing
@@ -788,9 +766,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return await withCheckedContinuation { continuation in
             alert.beginSheetModal(for: window) { response in
                 if response == .alertFirstButtonReturn {
-                    continuation.resume(returning: .keep(field.stringValue))
+                    continuation.resume(returning: .name(field.stringValue))
                 } else {
-                    continuation.resume(returning: .discard)
+                    continuation.resume(returning: .close)
                 }
             }
         }
@@ -1161,8 +1139,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 }
 
 private enum TitleChoice {
-    case keep(String)
-    case discard
+    case name(String)
+    case close
 }
 
 final class DisplayGate: @unchecked Sendable {

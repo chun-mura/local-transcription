@@ -67,7 +67,7 @@ open "$HOME/Applications/記録音.app"
 
 ヘッドホンを付ける。スピーカーだと相手の声がマイクに入り、「自分」の行にも出る。
 
-開始と停止のショートカットは ⌘⇧R。再生音は「相手」、マイクは「自分」になる。停止すると名前を聞く。空欄のまま保存できる。
+開始と停止のショートカットは ⌘⇧R。再生音は「相手」、マイクは「自分」になる。停止すると保存され、名前を聞きます。空欄のまま閉じても残ります。
 
 文字と音声は `~/Library/Application Support/LocalTranscription/sessions/` に残る。フォルダの中は `transcript.txt`、`audio-system.wav`（相手）、`audio-mic.wav`（自分）。
 

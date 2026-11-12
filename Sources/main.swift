@@ -102,6 +102,7 @@ actor Engine {
             hooks.preparing(false)
         }
         do {
+            _ = try SessionStore.sessionsRoot(create: true)
             try await ensurePermissions()
             hooks.status("日本語の認識モデルを確認しています")
             guard let locale = await SpeechSetup.japaneseLocale() else {
@@ -412,6 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var askingReset = false
     private var recordings: RecordingsController?
     private var frequentWords: FrequentWordsController?
+    private var saveLocation: SaveLocationController?
     private var titleQueue = TitlePromptQueue()
     private var presentingTitle = false
     private var closeAfterTitle = false
@@ -596,6 +598,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let vocabulary = NSMenuItem(title: "頻出ワード", action: #selector(showFrequentWordsMenu(_:)), keyEquivalent: "")
         vocabulary.target = self
         appMenu.addItem(vocabulary)
+        let location = NSMenuItem(title: "保存先", action: #selector(showSaveLocationMenu(_:)), keyEquivalent: "")
+        location.target = self
+        appMenu.addItem(location)
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         let appItem = NSMenuItem()
@@ -805,6 +810,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func showFrequentWordsMenu(_ sender: Any?) {
         showFrequentWords()
+    }
+
+    private func showSaveLocation() {
+        if saveLocation == nil {
+            let controller = SaveLocationController()
+            controller.onChange = { [weak self] in
+                self?.recordings?.reload(selecting: nil)
+            }
+            saveLocation = controller
+        }
+        saveLocation?.show()
+    }
+
+    @objc private func showSaveLocationMenu(_ sender: Any?) {
+        showSaveLocation()
     }
 
     private func samePath(_ stored: String?, _ other: String) -> Bool {
@@ -1207,11 +1227,10 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     func reload(selecting directory: URL?) {
-        let stamp = directory.flatMap { SessionCatalog.splitFolderName($0.lastPathComponent)?.stamp }
-            ?? selectedStamp()
+        let kept = directory ?? selectedDirectory()
         records = SessionCatalog.recordings()
         table.reloadData()
-        if let stamp, let row = records.firstIndex(where: { $0.stamp == stamp }) {
+        if let kept, let row = records.firstIndex(where: { SessionsRoot.same($0.directory, kept) }) {
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             table.scrollRowToVisible(row)
         }
@@ -1376,10 +1395,10 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
         return cell
     }
 
-    private func selectedStamp() -> String? {
+    private func selectedDirectory() -> URL? {
         let row = table.selectedRow
         guard records.indices.contains(row) else { return nil }
-        return records[row].stamp
+        return records[row].directory
     }
 
     private func syncEditor() {
@@ -1648,6 +1667,185 @@ final class FrequentWordsController: NSObject, NSTableViewDataSource, NSTableVie
         field.delegate = self
         field.cell?.sendsActionOnEndEditing = true
         return field
+    }
+}
+
+@MainActor
+final class SaveLocationController {
+    var onChange: () -> Void = {}
+
+    private var window: NSWindow?
+    private var support: URL?
+    private var snapshot = SessionsRoot.Snapshot(path: "", standard: true, unreadable: false)
+    private let pathField = NSTextField(labelWithString: "")
+    private let message = NSTextField(labelWithString: "")
+    private let changeButton = StampButton()
+    private let resetButton = StampButton()
+
+    func show() {
+        let window = self.window ?? makeWindow()
+        self.window = window
+        reload()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    private func reload() {
+        do {
+            let support = try SessionsRoot.supportDirectory(create: true)
+            self.support = support
+            snapshot = SessionsRoot.snapshot(in: support)
+        } catch {
+            support = nil
+            snapshot = SessionsRoot.Snapshot(path: "", standard: true, unreadable: false)
+            pathField.stringValue = ""
+            pathField.toolTip = nil
+            message.stringValue = "保存先の設定を置けません"
+            changeButton.isEnabled = false
+            resetButton.isEnabled = false
+            return
+        }
+        showSnapshot()
+    }
+
+    private func showSnapshot() {
+        pathField.stringValue = snapshot.path
+        pathField.toolTip = snapshot.path
+        changeButton.isEnabled = support != nil
+        resetButton.isEnabled = support != nil && !snapshot.standard
+        if snapshot.unreadable {
+            message.stringValue = "保存先の設定を読めないため、録音を始めていません。ファイルはそのままにしています"
+        } else {
+            message.stringValue = "新しい録音はこのフォルダに入ります。録音中のファイルはそのままです。これまでの記録には、標準のフォルダも出ます"
+        }
+    }
+
+    private func chooseFolder() {
+        guard let support, let window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "選ぶ"
+        panel.message = "このフォルダの中に、録音ごとのフォルダを作ります"
+        if !snapshot.unreadable {
+            let current = URL(fileURLWithPath: snapshot.path, isDirectory: true)
+            if FileManager.default.fileExists(atPath: current.path) {
+                panel.directoryURL = current
+            }
+        }
+        panel.beginSheetModal(for: window) { [weak self] response in
+            Task { @MainActor in
+                guard response == .OK, let url = panel.url, let self else { return }
+                self.adopt(url, in: support)
+            }
+        }
+    }
+
+    private func adopt(_ folder: URL, in support: URL) {
+        do {
+            try SessionsRoot.use(folder, in: support)
+            snapshot = SessionsRoot.snapshot(in: support)
+            showSnapshot()
+            onChange()
+        } catch is SessionsRootError {
+            message.stringValue = "そのフォルダを作れないため、保存先は変えていません"
+        } catch {
+            message.stringValue = "保存先を変えられませんでした"
+        }
+    }
+
+    private func reset() {
+        guard let support else { return }
+        do {
+            try SessionsRoot.clear(in: support)
+            snapshot = SessionsRoot.snapshot(in: support)
+            showSnapshot()
+            onChange()
+        } catch {
+            message.stringValue = "保存先を標準に戻せませんでした"
+        }
+    }
+
+    private func makeWindow() -> NSWindow {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 168),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "保存先"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.backgroundColor = Ink.paper
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        guard let content = window.contentView else { return window }
+        content.wantsLayer = true
+        content.layer?.backgroundColor = Ink.paper.cgColor
+
+        let pathBox = NSView()
+        pathBox.wantsLayer = true
+        pathBox.layer?.backgroundColor = Ink.sheet.cgColor
+
+        pathField.font = Face.sans(13)
+        pathField.textColor = Ink.ink
+        pathField.lineBreakMode = .byTruncatingMiddle
+        pathField.isSelectable = true
+        pathField.maximumNumberOfLines = 1
+        pathField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        message.font = Face.sans(12)
+        message.textColor = Ink.faint
+        message.maximumNumberOfLines = 2
+        message.lineBreakMode = .byWordWrapping
+        message.cell?.wraps = true
+        message.preferredMaxLayoutWidth = 520
+        message.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        changeButton.title = "変更"
+        changeButton.onPress = { [weak self] in self?.chooseFolder() }
+        resetButton.title = "標準に戻す"
+        resetButton.filled = false
+        resetButton.onPress = { [weak self] in self?.reset() }
+
+        let views = [pathBox, pathField, message, changeButton, resetButton]
+        for view in views {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            if view !== pathField {
+                content.addSubview(view)
+            }
+        }
+        pathBox.addSubview(pathField)
+        NSLayoutConstraint.activate([
+            pathBox.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            pathBox.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            pathBox.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            pathBox.heightAnchor.constraint(equalToConstant: 40),
+
+            pathField.leadingAnchor.constraint(equalTo: pathBox.leadingAnchor, constant: 12),
+            pathField.trailingAnchor.constraint(equalTo: pathBox.trailingAnchor, constant: -12),
+            pathField.centerYAnchor.constraint(equalTo: pathBox.centerYAnchor),
+
+            message.leadingAnchor.constraint(equalTo: pathBox.leadingAnchor),
+            message.trailingAnchor.constraint(equalTo: pathBox.trailingAnchor),
+            message.topAnchor.constraint(equalTo: pathBox.bottomAnchor, constant: 12),
+            message.heightAnchor.constraint(equalToConstant: 40),
+
+            changeButton.leadingAnchor.constraint(equalTo: pathBox.leadingAnchor),
+            changeButton.topAnchor.constraint(equalTo: message.bottomAnchor, constant: 12),
+            changeButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            changeButton.widthAnchor.constraint(equalToConstant: 72),
+            changeButton.heightAnchor.constraint(equalToConstant: 28),
+
+            resetButton.leadingAnchor.constraint(equalTo: changeButton.trailingAnchor, constant: 8),
+            resetButton.centerYAnchor.constraint(equalTo: changeButton.centerYAnchor),
+            resetButton.widthAnchor.constraint(equalToConstant: 112),
+            resetButton.heightAnchor.constraint(equalToConstant: 28)
+        ])
+        return window
     }
 }
 

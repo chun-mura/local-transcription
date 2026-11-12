@@ -46,17 +46,8 @@ final class SessionStore: @unchecked Sendable {
     }
 
     static func sessionsRoot(create: Bool) throws -> URL {
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: create
-        )
-        let root = base.appendingPathComponent("LocalTranscription/sessions", isDirectory: true)
-        if create {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        }
-        return root
+        let support = try SessionsRoot.supportDirectory(create: create)
+        return try SessionsRoot.recordingRoot(in: support, create: create)
     }
 
     static func create(format: AVAudioFormat) throws -> SessionStore {
@@ -130,6 +121,160 @@ final class SessionStore: @unchecked Sendable {
 
 }
 
+enum SessionsRootError: LocalizedError, Equatable {
+    case unreadable
+    case unavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .unreadable:
+            return "保存先の設定を読めないため、録音を始めていません"
+        case .unavailable:
+            return "保存先のフォルダを作れないため、録音を始めていません"
+        }
+    }
+}
+
+enum SessionsRoot {
+    enum Preference: Equatable {
+        case standard
+        case custom(URL)
+        case unreadable
+    }
+
+    struct Snapshot {
+        var path: String
+        var standard: Bool
+        var unreadable: Bool
+    }
+
+    static func supportDirectory(create: Bool) throws -> URL {
+        let base = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: create
+        )
+        let root = base.appendingPathComponent("LocalTranscription", isDirectory: true)
+        if create {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+        return root
+    }
+
+    static func fileURL(in support: URL) -> URL {
+        support.appendingPathComponent("sessions-root.txt")
+    }
+
+    static func defaultDirectory(in support: URL) -> URL {
+        support.appendingPathComponent("sessions", isDirectory: true)
+    }
+
+    static func load(in support: URL) -> Preference {
+        let url = fileURL(in: support)
+        guard FileManager.default.fileExists(atPath: url.path) else { return .standard }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return .unreadable }
+        let line = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return .standard }
+        guard trimmed.hasPrefix("/") else { return .unreadable }
+        return .custom(URL(fileURLWithPath: trimmed, isDirectory: true).standardizedFileURL)
+    }
+
+    static func snapshot(in support: URL) -> Snapshot {
+        switch load(in: support) {
+        case .standard:
+            return Snapshot(path: defaultDirectory(in: support).path, standard: true, unreadable: false)
+        case .custom(let url):
+            return Snapshot(path: url.path, standard: false, unreadable: false)
+        case .unreadable:
+            return Snapshot(path: fileURL(in: support).path, standard: false, unreadable: true)
+        }
+    }
+
+    static func listingRoots(in support: URL) -> [URL] {
+        var roots: [URL] = []
+        func append(_ url: URL) {
+            let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue,
+                  !roots.contains(where: { same($0, resolved) }) else {
+                return
+            }
+            roots.append(resolved)
+        }
+        append(defaultDirectory(in: support))
+        if case .custom(let url) = load(in: support) {
+            append(url)
+        }
+        return roots
+    }
+
+    static func recordingRoot(in support: URL, create: Bool) throws -> URL {
+        switch load(in: support) {
+        case .unreadable:
+            throw SessionsRootError.unreadable
+        case .standard:
+            let root = defaultDirectory(in: support)
+            if create {
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            }
+            return root
+        case .custom(let url):
+            try prepare(url, create: create)
+            return url
+        }
+    }
+
+    static func use(_ folder: URL, in support: URL) throws {
+        let folder = folder.standardizedFileURL
+        if same(folder, defaultDirectory(in: support)) {
+            try clear(in: support)
+            return
+        }
+        try prepare(folder, create: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try save(folder, in: support)
+    }
+
+    static func clear(in support: URL) throws {
+        let url = fileURL(in: support)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return }
+        guard !isDirectory.boolValue else { throw SessionsRootError.unreadable }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    static func same(_ lhs: URL, _ rhs: URL) -> Bool {
+        lhs.standardizedFileURL.resolvingSymlinksInPath().path == rhs.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    private static func prepare(_ url: URL, create: Bool) throws {
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            guard isDirectory.boolValue, FileManager.default.isWritableFile(atPath: url.path) else {
+                throw SessionsRootError.unavailable
+            }
+            return
+        }
+        guard create else { throw SessionsRootError.unavailable }
+        do {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        } catch {
+            throw SessionsRootError.unavailable
+        }
+        guard FileManager.default.isWritableFile(atPath: url.path) else {
+            throw SessionsRootError.unavailable
+        }
+    }
+
+    private static func save(_ folder: URL, in support: URL) throws {
+        let text = folder.standardizedFileURL.path + "\n"
+        try text.write(to: fileURL(in: support), atomically: true, encoding: .utf8)
+    }
+}
+
 struct Recording {
     var directory: URL
     var stamp: String
@@ -159,11 +304,21 @@ enum SessionCatalog {
     }
 
     static func recordings() -> [Recording] {
-        guard let root = try? SessionStore.sessionsRoot(create: false),
-              FileManager.default.fileExists(atPath: root.path) else {
-            return []
+        guard let support = try? SessionsRoot.supportDirectory(create: false) else { return [] }
+        return recordings(in: SessionsRoot.listingRoots(in: support))
+    }
+
+    static func recordings(in roots: [URL]) -> [Recording] {
+        var seen = Set<String>()
+        var all: [Recording] = []
+        for root in roots {
+            for recording in recordings(in: root) {
+                let key = recording.directory.standardizedFileURL.resolvingSymlinksInPath().path
+                guard seen.insert(key).inserted else { continue }
+                all.append(recording)
+            }
         }
-        return recordings(in: root)
+        return all.sorted { $0.stamp > $1.stamp }
     }
 
     static func recordings(in root: URL) -> [Recording] {

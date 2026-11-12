@@ -53,7 +53,7 @@ git pull
 open "$HOME/Applications/記録音.app"
 ```
 
-`./build.sh` は `~/Applications/記録音.app` を同じ証明書で置き換える。マイクと画面収録の許可は残る。録音と頻出ワードは `~/Library/Application Support/LocalTranscription/` にあり、置き換えても残る。
+`./build.sh` は `~/Applications/記録音.app` を同じ証明書で置き換える。マイクと画面収録の許可は残る。保存先の設定と頻出ワードは `~/Library/Application Support/LocalTranscription/` にあり、置き換えても残る。録音は、保存先で選んだフォルダに残る。
 
 証明書を変えて署名し直したときは、画面収録の許可を付け直す。
 
@@ -73,4 +73,4 @@ open "$HOME/Applications/記録音.app"
 
 開始と停止のショートカットは ⌘⇧R。再生音は「相手」、マイクは「自分」になる。停止すると保存され、名前を聞きます。空欄のまま閉じても残ります。
 
-文字と音声は `~/Library/Application Support/LocalTranscription/sessions/` に残る。フォルダの中は `transcript.txt`、`audio-system.wav`（相手）、`audio-mic.wav`（自分）。
+文字と音声は、メニューの「保存先」で選んだフォルダに残る。最初は `~/Library/Application Support/LocalTranscription/sessions/`。フォルダの中は `transcript.txt`、`audio-system.wav`（相手）、`audio-mic.wav`（自分）。

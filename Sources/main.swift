@@ -64,6 +64,7 @@ final class Router: @unchecked Sendable {
 
 actor Engine {
     private let hooks: UIHooks
+    private let words: FrequentWordsStore
     private let router = Router()
     private let capture = SystemCapture()
     private let maxSeconds: TimeInterval
@@ -79,8 +80,9 @@ actor Engine {
     private var generation = 0
     private var limitTask: Task<Void, Never>?
 
-    init(hooks: UIHooks) {
+    init(hooks: UIHooks, words: FrequentWordsStore) {
         self.hooks = hooks
+        self.words = words
         if let raw = ProcessInfo.processInfo.environment["SESSION_MAX_SECONDS"],
            let value = TimeInterval(raw), value >= 1 {
             maxSeconds = value
@@ -235,8 +237,8 @@ actor Engine {
 
     private func wire(_ channel: LiveChannel) {
         let speaker = channel.speaker
-        channel.onFinal = { [router, hooks] text in
-            let text = FinalReplacements.apply(text)
+        channel.onFinal = { [router, hooks, words] text in
+            let text = words.apply(text)
             guard let line = router.appendTranscript(speaker, text: text, at: Date()) else { return }
             hooks.line(line)
         }
@@ -383,6 +385,7 @@ struct Entry {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let hooks = UIHooks()
+    private let words: FrequentWordsStore
     private let engine: Engine
     private var window: NSWindow?
     private var statusLabel = FittingTextField(labelWithString: "停止中")
@@ -408,13 +411,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var resetting = false
     private var askingReset = false
     private var recordings: RecordingsController?
+    private var frequentWords: FrequentWordsController?
     private var titleQueue = TitlePromptQueue()
     private var presentingTitle = false
     private var closeAfterTitle = false
     private let deferredTitleStatus = "保存しました。名前は戻ってから付けます"
 
     override init() {
-        engine = Engine(hooks: hooks)
+        let words = FrequentWordsStore()
+        self.words = words
+        engine = Engine(hooks: hooks, words: words)
         super.init()
         wire()
     }
@@ -587,6 +593,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let archive = NSMenuItem(title: "これまでの記録", action: #selector(showRecordingsMenu(_:)), keyEquivalent: "")
         archive.target = self
         appMenu.addItem(archive)
+        let vocabulary = NSMenuItem(title: "頻出ワード", action: #selector(showFrequentWordsMenu(_:)), keyEquivalent: "")
+        vocabulary.target = self
+        appMenu.addItem(vocabulary)
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         let appItem = NSMenuItem()
@@ -807,6 +816,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func showRecordingsMenu(_ sender: Any?) {
         showRecordings()
+    }
+
+    private func showFrequentWords() {
+        if frequentWords == nil {
+            frequentWords = FrequentWordsController(store: words)
+        }
+        frequentWords?.show()
+    }
+
+    @objc private func showFrequentWordsMenu(_ sender: Any?) {
+        showFrequentWords()
     }
 
     private func samePath(_ stored: String?, _ other: String) -> Bool {
@@ -1424,6 +1444,232 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
         let row = table.selectedRow
         guard records.indices.contains(row) else { return }
         NSWorkspace.shared.open(records[row].directory)
+    }
+}
+
+final class FrequentWordsController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
+    private let store: FrequentWordsStore
+    private var rows: [FrequentWord] = []
+    private var unreadable = false
+    private var failedSave = false
+    private var window: NSWindow?
+    private var table = NSTableView()
+    private let message = NSTextField(labelWithString: "")
+    private let addButton = StampButton()
+    private let deleteButton = StampButton()
+
+    init(store: FrequentWordsStore) {
+        self.store = store
+    }
+
+    func show() {
+        let window = self.window ?? makeWindow()
+        self.window = window
+        reloadFromStore()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        rows.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let tableColumn, rows.indices.contains(row) else { return nil }
+        let field = reuseField(tableView, column: tableColumn)
+        field.tag = row
+        field.isEditable = !unreadable
+        switch tableColumn.identifier.rawValue {
+        case "word":
+            field.stringValue = rows[row].word
+            field.placeholderString = "Notion"
+        default:
+            field.stringValue = FrequentWords.formatSimilars(rows[row].similars)
+            field.placeholderString = "ノーション、ノーシオン"
+        }
+        return field
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        refreshChrome()
+    }
+
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, rows.indices.contains(field.tag) else { return }
+        table.selectRowIndexes(IndexSet(integer: field.tag), byExtendingSelection: false)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, rows.indices.contains(field.tag) else { return }
+        let row = field.tag
+        if field.identifier?.rawValue == "word" {
+            rows[row].word = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            field.stringValue = rows[row].word
+        } else {
+            rows[row].similars = FrequentWords.parseSimilars(field.stringValue)
+            field.stringValue = FrequentWords.formatSimilars(rows[row].similars)
+        }
+        persist()
+    }
+
+    private func reloadFromStore() {
+        let current = store.current()
+        rows = current.words
+        unreadable = current.unreadable
+        failedSave = false
+        table.reloadData()
+        refreshChrome()
+    }
+
+    private func persist() {
+        guard !unreadable else { return }
+        let stored = FrequentWords.storedForm(rows)
+        failedSave = !store.update(stored)
+        refreshChrome()
+    }
+
+    private func refreshChrome() {
+        addButton.isEnabled = !unreadable
+        deleteButton.isEnabled = !unreadable && table.selectedRow >= 0
+        if unreadable {
+            message.stringValue = "設定ファイルを読めないため、変換していません。ファイルはそのままにしています"
+        } else if failedSave {
+            message.stringValue = "保存できませんでした。変換は直前の内容のままです"
+        } else {
+            message.stringValue = "確定した文だけを変えます。誤って出る表記は、読点・カンマ・改行で区切ります"
+        }
+    }
+
+    @objc private func addRow() {
+        guard !unreadable else { return }
+        endEditing()
+        rows.append(FrequentWord(word: "", similars: []))
+        let row = rows.count - 1
+        table.reloadData()
+        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        table.scrollRowToVisible(row)
+        refreshChrome()
+        table.editColumn(0, row: row, with: nil, select: true)
+    }
+
+    @objc private func deleteRow() {
+        let row = table.selectedRow
+        endEditing()
+        guard !unreadable, rows.indices.contains(row) else { return }
+        rows.remove(at: row)
+        table.reloadData()
+        persist()
+    }
+
+    private func endEditing() {
+        window?.makeFirstResponder(nil)
+    }
+
+    private func makeWindow() -> NSWindow {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "頻出ワード"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.backgroundColor = Ink.paper
+        window.minSize = NSSize(width: 520, height: 280)
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        guard let content = window.contentView else { return window }
+        content.wantsLayer = true
+        content.layer?.backgroundColor = Ink.paper.cgColor
+
+        table.headerView = NSTableHeaderView()
+        table.backgroundColor = Ink.sheet
+        table.usesAlternatingRowBackgroundColors = false
+        table.gridStyleMask = []
+        table.rowHeight = 30
+        table.intercellSpacing = NSSize(width: 8, height: 6)
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.dataSource = self
+        table.delegate = self
+        table.addTableColumn(column("word", "言葉", 180))
+        let similars = column("similars", "誤って出る表記", 280)
+        similars.resizingMask = .autoresizingMask
+        table.addTableColumn(similars)
+
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = true
+        scroll.backgroundColor = Ink.sheet
+        scroll.borderType = .noBorder
+
+        message.font = Face.sans(12)
+        message.textColor = Ink.faint
+        message.maximumNumberOfLines = 2
+        message.lineBreakMode = .byWordWrapping
+        message.cell?.wraps = true
+
+        addButton.title = "追加"
+        addButton.onPress = { [weak self] in self?.addRow() }
+        deleteButton.title = "削除"
+        deleteButton.filled = false
+        deleteButton.onPress = { [weak self] in self?.deleteRow() }
+
+        let views = [scroll, addButton, deleteButton, message]
+        for view in views {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            scroll.bottomAnchor.constraint(equalTo: addButton.topAnchor, constant: -16),
+
+            addButton.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            addButton.bottomAnchor.constraint(equalTo: message.topAnchor, constant: -8),
+            addButton.widthAnchor.constraint(equalToConstant: 72),
+            addButton.heightAnchor.constraint(equalToConstant: 28),
+
+            deleteButton.leadingAnchor.constraint(equalTo: addButton.trailingAnchor, constant: 8),
+            deleteButton.centerYAnchor.constraint(equalTo: addButton.centerYAnchor),
+            deleteButton.widthAnchor.constraint(equalToConstant: 72),
+            deleteButton.heightAnchor.constraint(equalToConstant: 28),
+
+            message.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            message.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
+            message.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            message.heightAnchor.constraint(equalToConstant: 36)
+        ])
+        return window
+    }
+
+    private func column(_ identifier: String, _ title: String, _ width: CGFloat) -> NSTableColumn {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
+        column.title = title
+        column.width = width
+        column.minWidth = 80
+        return column
+    }
+
+    private func reuseField(_ tableView: NSTableView, column: NSTableColumn) -> NSTextField {
+        if let field = tableView.makeView(withIdentifier: column.identifier, owner: self) as? NSTextField {
+            return field
+        }
+        let field = NSTextField(string: "")
+        field.identifier = column.identifier
+        field.isBordered = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = Face.sans(13)
+        field.textColor = Ink.ink
+        field.lineBreakMode = .byTruncatingTail
+        field.delegate = self
+        field.cell?.sendsActionOnEndEditing = true
+        return field
     }
 }
 

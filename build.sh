@@ -48,7 +48,7 @@ mkdir -p "$APP/Contents/MacOS"
   -framework CoreGraphics \
   -framework Carbon \
   Sources/Convert.swift \
-  Sources/Replace.swift \
+  Sources/FrequentWords.swift \
   Sources/SessionStore.swift \
   Sources/Transcribe.swift \
   Sources/Capture.swift \

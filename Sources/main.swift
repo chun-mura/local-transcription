@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import AVFoundation
 import Carbon.HIToolbox
 import CoreGraphics
@@ -21,6 +22,7 @@ final class UIHooks: @unchecked Sendable {
     var running: @Sendable (Bool) -> Void = { _ in }
     var preparing: @Sendable (Bool) -> Void = { _ in }
     var finish: @Sendable (URL, @escaping @Sendable () -> Void) -> Void = { _, done in done() }
+    var sessionLines: @Sendable ([String]) -> Void = { _ in }
 }
 
 final class Router: @unchecked Sendable {
@@ -54,11 +56,18 @@ final class Router: @unchecked Sendable {
         channel?.append(buffer)
     }
 
-    func appendTranscript(_ speaker: Speaker, text: String, at date: Date) -> String? {
+    func appendTranscript(_ speaker: Speaker, text: String, at date: Date, start: Double, end: Double) -> String? {
         lock.lock()
         let store = store
         lock.unlock()
-        return store?.append(speaker: speaker, text: text, at: date)
+        return store?.append(speaker: speaker, text: text, at: date, start: start, end: end)
+    }
+
+    func systemAudioTime() -> Double {
+        lock.lock()
+        let channel = system
+        lock.unlock()
+        return channel?.audioTime() ?? 0
     }
 }
 
@@ -79,6 +88,8 @@ actor Engine {
     private var awaitingTitle = false
     private var generation = 0
     private var limitTask: Task<Void, Never>?
+    private var captions: CaptionWatch?
+    private var askedAccessibility = false
 
     init(hooks: UIHooks, words: FrequentWordsStore) {
         self.hooks = hooks
@@ -217,6 +228,7 @@ actor Engine {
         active = true
         hooks.path(store.directory.path)
         hooks.running(true)
+        startCaptions()
         hooks.status(runningStatus())
         armLimit()
     }
@@ -238,9 +250,9 @@ actor Engine {
 
     private func wire(_ channel: LiveChannel) {
         let speaker = channel.speaker
-        channel.onFinal = { [router, hooks, words] text in
+        channel.onFinal = { [router, hooks, words] text, start, end in
             let text = words.apply(text)
-            guard let line = router.appendTranscript(speaker, text: text, at: Date()) else { return }
+            guard let line = router.appendTranscript(speaker, text: text, at: Date(), start: start, end: end) else { return }
             hooks.line(line)
         }
         channel.onVolatile = { [hooks] text in
@@ -312,10 +324,29 @@ actor Engine {
         await capture.stop()
         await system?.finish()
         await microphone?.finish()
+        let log = captions?.stop() ?? SpeakerLog(marks: [], localNames: [])
+        captions = nil
         if discard {
             store?.discard()
-        } else {
-            store?.close()
+        } else if let store {
+            let until = system?.audioTime() ?? 0
+            var labels: [Int: String] = [:]
+            for (index, segment) in store.snapshot().enumerated() where segment.speaker == .system {
+                if let name = SpeakerAssign.remoteLabel(
+                    start: segment.start,
+                    end: segment.end,
+                    marks: log.marks,
+                    localNames: log.localNames,
+                    until: until
+                ) {
+                    labels[index] = name
+                }
+            }
+            let lines = store.replaceRemoteLabels(labels)
+            if updateUI {
+                hooks.sessionLines(lines)
+            }
+            store.close()
         }
         router.clear()
         store = nil
@@ -340,10 +371,22 @@ actor Engine {
     }
 
     private func runningStatus() -> String {
-        if maxSeconds == 7_200 {
-            return "録音中"
+        let base = maxSeconds == 7_200 ? "録音中" : "録音中（\(Int(maxSeconds))秒で区切ります）"
+        if AXIsProcessTrusted() { return base }
+        return base + "。話者名にはアクセシビリティの許可が必要です"
+    }
+
+    private func startCaptions() {
+        if !AXIsProcessTrusted(), !askedAccessibility {
+            askedAccessibility = true
+            let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+            _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
         }
-        return "録音中（\(Int(maxSeconds))秒で区切ります）"
+        let watch = CaptionWatch()
+        watch.start { [router] in
+            router.systemAudioTime()
+        }
+        captions = watch
     }
 
     private func ensurePermissions() async throws {
@@ -465,6 +508,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Task { @MainActor in
                 guard let self, displayGate.current() == generation else { return }
                 self.appendLine(line)
+            }
+        }
+        hooks.sessionLines = { [weak self, displayGate] lines in
+            let generation = displayGate.current()
+            Task { @MainActor in
+                guard let self, displayGate.current() == generation else { return }
+                self.clearTranscript()
+                for line in lines {
+                    self.appendLine(line)
+                }
             }
         }
         hooks.volatile = { [weak self, displayGate] speaker, text in
@@ -867,7 +920,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func appendLine(_ line: String) {
-        let parsed = ParsedLine(line)
+        let parsed = TranscriptLine(line) ?? TranscriptLine(time: "", label: "", text: line)
         let paragraph = NSMutableParagraphStyle()
         paragraph.paragraphSpacing = 8
         paragraph.lineBreakMode = .byWordWrapping
@@ -982,6 +1035,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hint.textColor = Ink.faint
         hint.preferredMaxLayoutWidth = 480
 
+        let captionHint = NSTextField(labelWithString: "Meet の字幕、または Teams のライブキャプションをオンにすると、停止後に相手の名前が付きます。")
+        styleField(captionHint, maxLines: 2)
+        captionHint.font = Face.sans(12)
+        captionHint.textColor = Ink.faint
+        captionHint.preferredMaxLayoutWidth = 584
+
         styleField(pathLabel)
         pathLabel.lineBreakMode = .byTruncatingMiddle
         pathLabel.font = Face.sans(11)
@@ -1051,7 +1110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             object: scrollView.contentView
         )
 
-        let views = [title, seal, statusLabel, resetButton, recordsButton, sideButton, startButton, sheet, margin, opponentLine, selfLine, scrollView, latestButton, hint, pathLabel]
+        let views = [title, seal, statusLabel, resetButton, recordsButton, sideButton, startButton, sheet, margin, opponentLine, selfLine, scrollView, latestButton, hint, captionHint, pathLabel]
         for view in views {
             view.translatesAutoresizingMaskIntoConstraints = false
             if view === margin || view === opponentLine || view === selfLine || view === scrollView || view === latestButton {
@@ -1125,7 +1184,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
             hint.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
             hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
-            hint.bottomAnchor.constraint(equalTo: pathLabel.topAnchor, constant: -4),
+            hint.bottomAnchor.constraint(equalTo: captionHint.topAnchor, constant: -4),
+
+            captionHint.leadingAnchor.constraint(equalTo: hint.leadingAnchor),
+            captionHint.trailingAnchor.constraint(equalTo: hint.trailingAnchor),
+            captionHint.bottomAnchor.constraint(equalTo: pathLabel.topAnchor, constant: -4),
 
             pathLabel.leadingAnchor.constraint(equalTo: hint.leadingAnchor),
             pathLabel.trailingAnchor.constraint(equalTo: hint.trailingAnchor),
@@ -1177,31 +1240,6 @@ final class DisplayGate: @unchecked Sendable {
         lock.lock()
         generation += 1
         lock.unlock()
-    }
-}
-
-private struct ParsedLine {
-    var time: String
-    var label: String
-    var text: String
-
-    init(_ line: String) {
-        guard line.hasPrefix("["), let close = line.firstIndex(of: "]") else {
-            time = ""
-            label = ""
-            text = line
-            return
-        }
-        time = String(line[line.index(after: line.startIndex)..<close])
-        let rest = line[line.index(after: close)...].drop { $0 == " " }
-        if rest.hasPrefix("自分") {
-            label = "自分"
-        } else if rest.hasPrefix("相手") {
-            label = "相手"
-        } else {
-            label = ""
-        }
-        text = String(rest.dropFirst(label.count)).trimmingCharacters(in: .whitespaces)
     }
 }
 

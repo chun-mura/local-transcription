@@ -13,6 +13,46 @@ enum Speaker: String, Sendable {
     }
 }
 
+struct TranscriptSegment: Equatable {
+    var speaker: Speaker
+    var wall: Date
+    var start: Double
+    var end: Double
+    var text: String
+}
+
+struct TranscriptLine: Equatable {
+    var time: String
+    var label: String
+    var text: String
+
+    init(time: String, label: String, text: String) {
+        self.time = time
+        self.label = label
+        self.text = text
+    }
+
+    init?(_ line: String) {
+        guard line.hasPrefix("["), let close = line.firstIndex(of: "]") else { return nil }
+        let timeStart = line.index(after: line.startIndex)
+        time = String(line[timeStart..<close])
+        let rest = line[line.index(after: close)...].drop { $0 == " " }
+        if let tab = rest.firstIndex(of: "\t") {
+            label = rest[..<tab].trimmingCharacters(in: .whitespaces)
+            text = rest[rest.index(after: tab)...].trimmingCharacters(in: .whitespaces)
+            return
+        }
+        if rest.hasPrefix("自分 ") || rest == "自分" {
+            label = "自分"
+        } else if rest.hasPrefix("相手 ") || rest == "相手" {
+            label = "相手"
+        } else {
+            return nil
+        }
+        text = rest.dropFirst(label.count).trimmingCharacters(in: .whitespaces)
+    }
+}
+
 final class SessionStore: @unchecked Sendable {
     let directory: URL
     let transcriptURL: URL
@@ -21,12 +61,15 @@ final class SessionStore: @unchecked Sendable {
     private var microphoneFile: AVAudioFile?
     private var transcript: FileHandle?
     private let clock: DateFormatter
+    private let header: String
+    private var segments: [TranscriptSegment] = []
     private var loggedWriteError = false
 
-    private init(directory: URL, transcriptURL: URL, transcript: FileHandle, format: AVAudioFormat) throws {
+    private init(directory: URL, transcriptURL: URL, transcript: FileHandle, header: String, format: AVAudioFormat) throws {
         self.directory = directory
         self.transcriptURL = transcriptURL
         self.transcript = transcript
+        self.header = header
         let clock = DateFormatter()
         clock.locale = Locale(identifier: "en_US_POSIX")
         clock.dateFormat = "HH:mm:ss"
@@ -72,7 +115,7 @@ final class SessionStore: @unchecked Sendable {
         try header.data(using: .utf8)?.write(to: transcriptURL)
         let handle = try FileHandle(forWritingTo: transcriptURL)
         try handle.seekToEnd()
-        return try SessionStore(directory: directory, transcriptURL: transcriptURL, transcript: handle, format: format)
+        return try SessionStore(directory: directory, transcriptURL: transcriptURL, transcript: handle, header: header, format: format)
     }
 
     func write(_ speaker: Speaker, buffer: AVAudioPCMBuffer) {
@@ -90,10 +133,11 @@ final class SessionStore: @unchecked Sendable {
     }
 
     @discardableResult
-    func append(speaker: Speaker, text: String, at date: Date) -> String {
+    func append(speaker: Speaker, text: String, at date: Date, start: Double, end: Double) -> String {
         lock.lock()
         defer { lock.unlock() }
-        let line = "[\(clock.string(from: date))] \(speaker.label) \(text)"
+        segments.append(TranscriptSegment(speaker: speaker, wall: date, start: start, end: end, text: text))
+        let line = Self.line(wall: date, label: speaker.label, text: text, clock: clock)
         if let data = (line + "\n").data(using: .utf8) {
             do {
                 try transcript?.write(contentsOf: data)
@@ -102,6 +146,39 @@ final class SessionStore: @unchecked Sendable {
             }
         }
         return line
+    }
+
+    func snapshot() -> [TranscriptSegment] {
+        lock.lock()
+        defer { lock.unlock() }
+        return segments
+    }
+
+    func replaceRemoteLabels(_ labels: [Int: String]) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        var lines: [String] = []
+        for (index, segment) in segments.enumerated() {
+            let label = labels[index] ?? segment.speaker.label
+            lines.append(Self.line(wall: segment.wall, label: label, text: segment.text, clock: clock))
+        }
+        let body = header + lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
+        try? transcript?.close()
+        transcript = nil
+        do {
+            try body.write(to: transcriptURL, atomically: true, encoding: .utf8)
+        } catch {
+            fputs("話者名の書き込みに失敗しました: \(error)\n", stderr)
+        }
+        return lines
+    }
+
+    private static func line(wall: Date, label: String, text: String, clock: DateFormatter) -> String {
+        let stamp = "[\(clock.string(from: wall))]"
+        if label == "自分" || label == "相手" {
+            return "\(stamp) \(label) \(text)"
+        }
+        return "\(stamp) \(label)\t\(text)"
     }
 
     func close() {
@@ -452,8 +529,8 @@ enum SessionCatalog {
 
     private static func firstOpponent(in text: String) -> String {
         for line in normalizedLines(text) {
-            guard let range = line.range(of: "] 相手 ") else { continue }
-            return String(line[range.upperBound...])
+            guard let parsed = TranscriptLine(line), parsed.label != "自分", !parsed.text.isEmpty else { continue }
+            return parsed.text
         }
         return ""
     }

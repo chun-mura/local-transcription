@@ -17,7 +17,7 @@ final class LiveChannel: @unchecked Sendable {
     private var lastFinalStart: CMTime?
     private var reportedLag = false
 
-    var onFinal: (@Sendable (String) -> Void)?
+    var onFinal: (@Sendable (String, Double, Double) -> Void)?
     var onVolatile: (@Sendable (String) -> Void)?
     var onLag: (@Sendable () -> Void)?
     var onFailure: (@Sendable (String) -> Void)?
@@ -71,6 +71,12 @@ final class LiveChannel: @unchecked Sendable {
         lock.unlock()
         let time = CMTime(value: start, timescale: CMTimeScale(sampleRate.rounded()))
         continuation?.yield(AnalyzerInput(buffer: buffer, bufferStartTime: time))
+    }
+
+    func audioTime() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return sampleRate > 0 ? Double(frames) / sampleRate : 0
     }
 
     func finish() async {
@@ -131,7 +137,11 @@ final class LiveChannel: @unchecked Sendable {
             }
             lastFinalStart = result.range.start
             lock.unlock()
-            onFinal?(text)
+            let start = CMTimeGetSeconds(result.range.start)
+            let endSeconds = CMTimeGetSeconds(CMTimeRangeGetEnd(result.range))
+            let rangeStart = start.isFinite ? start : 0
+            let rangeEnd = endSeconds.isFinite ? max(endSeconds, rangeStart) : rangeStart
+            onFinal?(text, rangeStart, rangeEnd)
             onVolatile?("")
         } else {
             onVolatile?(text)

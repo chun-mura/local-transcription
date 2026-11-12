@@ -47,8 +47,11 @@ mkdir -p "$APP/Contents/MacOS"
   -framework CoreMedia \
   -framework CoreGraphics \
   -framework Carbon \
+  -framework ApplicationServices \
   Sources/Convert.swift \
   Sources/FrequentWords.swift \
+  Sources/CaptionRead.swift \
+  Sources/CaptionWatch.swift \
   Sources/SessionStore.swift \
   Sources/Transcribe.swift \
   Sources/Capture.swift \

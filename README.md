@@ -8,17 +8,27 @@ Mac の再生音とマイクを、別々の字幕としてその場で文字に�
 
 - Apple Silicon の Mac
 - macOS 26
-- Xcode（`swiftc` と、画面収録の許可に必要な署名の両方に使う）
-- Apple ID（無料のアカウントでよい）
+- Command Line Tools（`swiftc` と `codesign`。未導入なら `xcode-select --install`）
+- 画面収録の許可まで通す場合は Xcode と Apple ID（無料のアカウントでよい）
 
 ## 署名の証明書を作る
 
 画面収録の許可は、Team ID のある証明書で署名したアプリに付く。アドホック署名のままでは、システム設定でオンにしてもアプリ側は未許可のままになる。
 
+Xcode があるときは、次で Apple Development を作る。
+
 1. Xcode を開き、Settings → Accounts で Apple ID を追加する。
 2. 追加したアカウントを選び、Manage Certificates… から Apple Development を作る。
 
-証明書ができているかは、次で確認できる。`Apple Development:` で始まる行が出ればよい。
+Xcode が無いときは、この Mac の中に自己署名の証明書を作る。確認のダイアログが出ることがある。
+
+```bash
+./scripts/make-signing-identity.sh
+```
+
+この証明書には Team ID が無い。画面収録が拒否されたままになることがある。録音まで通すには、上の Apple Development でビルドし直す。
+
+証明書ができているかは、次で確認できる。`Apple Development:` または `local-transcription-dev` の行が出ればよい。
 
 ```bash
 security find-identity -v -p codesigning
@@ -31,12 +41,6 @@ clone したディレクトリで実行する。`~/Applications/記録音.app` �
 ```bash
 ./build.sh
 open "$HOME/Applications/記録音.app"
-```
-
-`swiftc` が見つからないときは、Xcode を入れてから次を実行し、もう一度 `./build.sh` する。
-
-```bash
-sudo xcode-select -s /Applications/Xcode.app
 ```
 
 ## ソースが更新されたとき
@@ -70,14 +74,3 @@ open "$HOME/Applications/記録音.app"
 開始と停止のショートカットは ⌘⇧R。再生音は「相手」、マイクは「自分」になる。停止すると保存され、名前を聞きます。空欄のまま閉じても残ります。
 
 文字と音声は `~/Library/Application Support/LocalTranscription/sessions/` に残る。フォルダの中は `transcript.txt`、`audio-system.wav`（相手）、`audio-mic.wav`（自分）。
-
-## 証明書を Xcode で作れないとき
-
-`./build.sh` は、Apple Development が無いとここで止まる。次は、この Mac の中に自己署名の証明書を作る。確認のダイアログが出ることがある。
-
-```bash
-./scripts/make-signing-identity.sh
-./build.sh
-```
-
-この証明書には Team ID が無い。画面収録が拒否されたままになることがある。録音まで通すには、上の Apple Development でビルドし直す。

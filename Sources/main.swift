@@ -1035,8 +1035,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.isMovableByWindowBackground = true
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = Ink.paper
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.minSize = NSSize(width: 640, height: 480)
         window.center()
 
@@ -1350,8 +1348,6 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
         window.backgroundColor = Ink.paper
         window.minSize = NSSize(width: 560, height: 320)
         window.isReleasedWhenClosed = false
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         guard let content = window.contentView else { return window }
         content.wantsLayer = true
@@ -1663,8 +1659,6 @@ final class FrequentWordsController: NSObject, NSTableViewDataSource, NSTableVie
         window.backgroundColor = Ink.paper
         window.minSize = NSSize(width: 520, height: 280)
         window.isReleasedWhenClosed = false
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         guard let content = window.contentView else { return window }
         content.wantsLayer = true
@@ -1868,8 +1862,6 @@ final class SaveLocationController {
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = Ink.paper
         window.isReleasedWhenClosed = false
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         guard let content = window.contentView else { return window }
         content.wantsLayer = true

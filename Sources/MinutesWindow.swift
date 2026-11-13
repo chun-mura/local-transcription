@@ -67,8 +67,6 @@ final class MinutesController: NSObject {
         window.backgroundColor = Ink.paper
         window.minSize = NSSize(width: 640, height: 480)
         window.isReleasedWhenClosed = false
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         guard let content = window.contentView else { return window }
         content.wantsLayer = true
         content.layer?.backgroundColor = Ink.paper.cgColor

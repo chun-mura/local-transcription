@@ -648,6 +648,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let archive = NSMenuItem(title: "これまでの記録", action: #selector(showRecordingsMenu(_:)), keyEquivalent: "")
         archive.target = self
         appMenu.addItem(archive)
+        let minutes = NSMenuItem(title: "議事録", action: #selector(showMinutesMenu(_:)), keyEquivalent: "")
+        minutes.target = self
+        appMenu.addItem(minutes)
         let vocabulary = NSMenuItem(title: "頻出ワード", action: #selector(showFrequentWordsMenu(_:)), keyEquivalent: "")
         vocabulary.target = self
         appMenu.addItem(vocabulary)
@@ -852,6 +855,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func showRecordingsMenu(_ sender: Any?) {
         showRecordings()
+    }
+
+    @objc private func showMinutesMenu(_ sender: Any?) {
+        showRecordings()
+        recordings?.openMinutes()
     }
 
     private func showFrequentWords() {
@@ -1251,9 +1259,11 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
     private var window: NSWindow?
     private var table = NSTableView()
     private var records: [Recording] = []
+    private var minutes: MinutesController?
     private let nameField = NSTextField(string: "")
     private let message = NSTextField(labelWithString: "")
     private let applyButton = StampButton()
+    private let minutesButton = StampButton()
     private let openButton = StampButton()
 
     func show() {
@@ -1366,11 +1376,15 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
 
         applyButton.title = "付ける"
         applyButton.onPress = { [weak self] in self?.applyName(nil) }
+        minutesButton.title = "議事録"
+        minutesButton.filled = false
+        minutesButton.toolTip = "選んだ記録から議事録を作る"
+        minutesButton.onPress = { [weak self] in self?.openMinutes() }
         openButton.title = "フォルダ"
         openButton.filled = false
         openButton.onPress = { [weak self] in self?.openSelected(nil) }
 
-        let views = [scroll, nameField, message, applyButton, openButton]
+        let views = [scroll, nameField, message, applyButton, minutesButton, openButton]
         for view in views {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
@@ -1390,7 +1404,12 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
             applyButton.widthAnchor.constraint(equalToConstant: 72),
             applyButton.heightAnchor.constraint(equalToConstant: 28),
 
-            openButton.leadingAnchor.constraint(equalTo: applyButton.trailingAnchor, constant: 8),
+            minutesButton.leadingAnchor.constraint(equalTo: applyButton.trailingAnchor, constant: 8),
+            minutesButton.centerYAnchor.constraint(equalTo: nameField.centerYAnchor),
+            minutesButton.widthAnchor.constraint(equalToConstant: 84),
+            minutesButton.heightAnchor.constraint(equalToConstant: 28),
+
+            openButton.leadingAnchor.constraint(equalTo: minutesButton.trailingAnchor, constant: 8),
             openButton.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
             openButton.centerYAnchor.constraint(equalTo: nameField.centerYAnchor),
             openButton.widthAnchor.constraint(equalToConstant: 92),
@@ -1445,6 +1464,7 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
             nameField.stringValue = ""
             nameField.isEnabled = false
             applyButton.isEnabled = false
+            minutesButton.isEnabled = false
             openButton.isEnabled = false
             message.stringValue = records.isEmpty ? "まだ記録はありません" : "記録を選んでください"
             return
@@ -1454,6 +1474,7 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
         nameField.stringValue = record.title
         nameField.isEnabled = !active
         applyButton.isEnabled = !active
+        minutesButton.isEnabled = true
         openButton.isEnabled = true
         message.stringValue = active ? "録音中です。停止したときに名前を付けられます" : ""
     }
@@ -1479,6 +1500,17 @@ final class RecordingsController: NSObject, NSTableViewDataSource, NSTableViewDe
         let row = table.selectedRow
         guard records.indices.contains(row) else { return }
         NSWorkspace.shared.open(records[row].directory)
+    }
+
+    func openMinutes() {
+        guard let directory = selectedDirectory() else {
+            message.stringValue = "記録を選んでください"
+            return
+        }
+        if minutes == nil {
+            minutes = MinutesController()
+        }
+        minutes?.show(directory: directory)
     }
 }
 

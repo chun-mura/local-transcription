@@ -44,6 +44,7 @@ mkdir -p "$APP/Contents/MacOS"
   -framework AVFoundation \
   -framework ScreenCaptureKit \
   -framework Speech \
+  -framework FoundationModels \
   -framework CoreMedia \
   -framework CoreGraphics \
   -framework Carbon \
@@ -53,6 +54,8 @@ mkdir -p "$APP/Contents/MacOS"
   Sources/CaptionRead.swift \
   Sources/CaptionWatch.swift \
   Sources/SessionStore.swift \
+  Sources/Minutes.swift \
+  Sources/MinutesWindow.swift \
   Sources/Transcribe.swift \
   Sources/Capture.swift \
   Sources/TitlePrompt.swift \

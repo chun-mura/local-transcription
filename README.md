@@ -74,3 +74,5 @@ open "$HOME/Applications/記録音.app"
 開始と停止のショートカットは ⌘⇧R。再生音は「相手」、マイクは「自分」になる。停止すると保存され、名前を聞きます。空欄のまま閉じても残ります。
 
 文字と音声は、メニューの「保存先」で選んだフォルダに残る。最初は `~/Library/Application Support/LocalTranscription/sessions/`。フォルダの中は `transcript.txt`、`audio-system.wav`（相手）、`audio-mic.wav`（自分）。
+
+議事録は、メニューの「これまでの記録」で1件選んで「議事録」。型はあらかじめ入っていて、この回だけ別の文章にできる。チェックを入れたときだけ、その型を次からも使う。Apple Intelligence か、この Mac で動いている Ollama を選ぶ。できた文章は、同じフォルダの `minutes.md` に入る。

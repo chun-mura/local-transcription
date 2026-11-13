@@ -663,7 +663,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         appItem.submenu = appMenu
         let main = NSMenu()
         main.addItem(appItem)
+        main.addItem(editMenuItem())
         NSApp.mainMenu = main
+    }
+
+    private func editMenuItem() -> NSMenuItem {
+        let menu = NSMenu(title: "編集")
+        menu.addItem(editItem("カット", #selector(NSText.cut(_:)), "x"))
+        menu.addItem(editItem("コピー", #selector(NSText.copy(_:)), "c"))
+        menu.addItem(editItem("ペースト", #selector(NSText.paste(_:)), "v"))
+        menu.addItem(editItem("すべてを選択", #selector(NSText.selectAll(_:)), "a"))
+        let item = NSMenuItem()
+        item.title = "編集"
+        item.submenu = menu
+        return item
+    }
+
+    private func editItem(_ title: String, _ action: Selector, _ key: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = nil
+        return item
     }
 
     private func refreshSideButton() {

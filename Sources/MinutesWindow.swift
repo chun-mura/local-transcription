@@ -16,13 +16,13 @@ final class MinutesController: NSObject {
     private let modelPopup = NSPopUpButton()
     private let contextLabel = NSTextField(labelWithString: "文脈")
     private let contextField = NSTextField(string: "8192")
-    private let promptView = NSTextView()
+    private let promptView = MinutesTextView()
     private let saveDefault = NSButton(checkboxWithTitle: "この型を既定にする", target: nil, action: nil)
     private let makeButton = StampButton()
     private let stopButton = StampButton()
     private let openButton = StampButton()
     private let message = NSTextField(wrappingLabelWithString: "")
-    private let resultView = NSTextView()
+    private let resultView = MinutesTextView()
 
     func show(directory: URL) {
         let window = self.window ?? makeWindow()
@@ -187,6 +187,7 @@ final class MinutesController: NSObject {
             resultScroll.heightAnchor.constraint(equalTo: promptScroll.heightAnchor)
         ])
         applyProviderVisibility()
+        window.initialFirstResponder = promptView
         return window
     }
 
@@ -452,8 +453,14 @@ final class MinutesController: NSObject {
         text.isEditable = editable
         text.isSelectable = true
         text.isRichText = false
+        text.importsGraphics = false
         text.font = Face.sans(13)
         text.textColor = Ink.ink
+        text.insertionPointColor = Ink.ink
+        text.selectedTextAttributes = [
+            .backgroundColor: Ink.ink.withAlphaComponent(0.16),
+            .foregroundColor: Ink.ink
+        ]
         text.backgroundColor = Ink.sheet
         text.drawsBackground = true
         text.textContainerInset = NSSize(width: 8, height: 8)
@@ -478,6 +485,18 @@ final class MinutesController: NSObject {
         scroll.backgroundColor = Ink.sheet
         scroll.borderType = .noBorder
         return scroll
+    }
+}
+
+final class MinutesTextView: NSTextView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        var size = newSize
+        if let clipHeight = enclosingScrollView?.contentSize.height, size.height < clipHeight {
+            size.height = clipHeight
+        }
+        super.setFrameSize(size)
     }
 }
 

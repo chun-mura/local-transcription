@@ -23,6 +23,7 @@ final class UIHooks: @unchecked Sendable {
     var preparing: @Sendable (Bool) -> Void = { _ in }
     var finish: @Sendable (URL, @escaping @Sendable () -> Void) -> Void = { _, done in done() }
     var sessionLines: @Sendable ([String]) -> Void = { _ in }
+    var reveal: @Sendable () -> Void = {}
 }
 
 final class Router: @unchecked Sendable {
@@ -146,6 +147,7 @@ actor Engine {
                     hooks.permission(nil)
                 }
             }
+            hooks.reveal()
         }
     }
 
@@ -427,7 +429,7 @@ struct Entry {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let hooks = UIHooks()
     private let words: FrequentWordsStore
     private let engine: Engine
@@ -461,6 +463,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var presentingTitle = false
     private var closeAfterTitle = false
     private let deferredTitleStatus = "保存しました。名前は戻ってから付けます"
+    private var statusItem: NSStatusItem?
+    private var statusToggle: NSMenuItem?
 
     override init() {
         let words = FrequentWordsStore()
@@ -479,6 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let window = makeWindow()
         self.window = window
         window.delegate = self
+        installStatusItem()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
     }
@@ -488,7 +493,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            showMainWindow(nil)
+        }
+        return true
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -501,7 +513,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func wire() {
         hooks.status = { [weak self] text in
-            Task { @MainActor in self?.statusLabel.stringValue = text }
+            Task { @MainActor in self?.setStatus(text) }
+        }
+        hooks.reveal = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.window?.isVisible != true else { return }
+                self.showMainWindow(nil)
+            }
         }
         hooks.line = { [weak self, displayGate] line in
             let generation = displayGate.current()
@@ -581,27 +599,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    private func refreshStartButton() {
+    private func recordingControl() -> (title: String, enabled: Bool) {
         let locked = naming || resetting || askingReset
         if locked {
-            startButton.title = running ? "停止" : "開始"
-            startButton.isEnabled = false
-        } else if preparing && !running {
-            startButton.title = "準備中"
-            startButton.isEnabled = false
-        } else if running {
-            startButton.title = "停止"
-            startButton.isEnabled = true
-        } else {
-            startButton.title = "開始"
-            startButton.isEnabled = true
+            return (running ? "停止" : "開始", false)
         }
+        if preparing && !running {
+            return ("準備中", false)
+        }
+        if running {
+            return ("停止", true)
+        }
+        return ("開始", true)
+    }
+
+    private func refreshStartButton() {
+        let control = recordingControl()
+        let locked = naming || resetting || askingReset
+        startButton.title = control.title
+        startButton.isEnabled = control.enabled
         startButton.toolTip = "⌘⇧R"
         resetButton.isEnabled = running && !locked && !preparing
+        statusToggle?.title = control.title
+        statusItem?.button?.image = running ? MenuBarMark.recording : MenuBarMark.idle
+        statusItem?.button?.setAccessibilityLabel(running ? "記録音、録音中" : "記録音")
+    }
+
+    private func setStatus(_ text: String) {
+        statusLabel.stringValue = text
+        statusItem?.button?.toolTip = text
     }
 
     @objc func toggleRecording(_ sender: Any?) {
         pressStart()
+    }
+
+    @objc private func showMainWindow(_ sender: Any?) {
+        guard let window else { return }
+        let alreadyActive = NSApp.isActive
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+        if alreadyActive {
+            Task { await presentPendingTitles() }
+        }
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        refreshStartButton()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -617,23 +661,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Task { await presentPendingTitles() }
             return false
         }
-        if !running {
-            return true
-        }
-        let alert = NSAlert()
-        alert.messageText = "録音を止めて終了しますか"
-        alert.informativeText = "止めると保存して終了します。"
-        alert.addButton(withTitle: "止めて終了")
-        alert.addButton(withTitle: "録音を続ける")
-        alert.beginSheetModal(for: sender) { [weak self] response in
-            guard response == .alertFirstButtonReturn, let self else { return }
-            self.closingAfterStop = true
-            Task { @MainActor in
-                await self.engine.stop()
-                sender.close()
-            }
-        }
-        return false
+        return true
     }
 
     private func installMenu() {
@@ -665,6 +693,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         main.addItem(appItem)
         main.addItem(editMenuItem())
         NSApp.mainMenu = main
+    }
+
+    private func installStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        let menu = NSMenu()
+        menu.delegate = self
+        let toggle = NSMenuItem(title: "開始", action: #selector(toggleRecording(_:)), keyEquivalent: "")
+        toggle.target = self
+        menu.addItem(toggle)
+        let show = NSMenuItem(title: "記録音を表示", action: #selector(showMainWindow(_:)), keyEquivalent: "")
+        show.target = self
+        menu.addItem(show)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        menu.addItem(quit)
+        item.menu = menu
+        item.button?.imageScaling = .scaleProportionallyDown
+        statusItem = item
+        statusToggle = toggle
+        refreshStartButton()
+        setStatus(statusLabel.stringValue)
     }
 
     private func editMenuItem() -> NSMenuItem {
@@ -702,6 +752,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(resetRecording(_:)) {
             return running && !naming && !resetting && !askingReset && !preparing
+        }
+        if menuItem.action == #selector(toggleRecording(_:)) {
+            return recordingControl().enabled
         }
         return true
     }
@@ -756,7 +809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             seal.active = false
             clearTranscript()
             if save {
-                statusLabel.stringValue = "ここまでを保存しました"
+                setStatus("ここまでを保存しました")
                 let kept = sessionPath.map { URL(fileURLWithPath: $0) }
                 recordings?.reload(selecting: kept)
             } else {
@@ -764,7 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 pathLabel.stringValue = ""
                 refreshSideButton()
                 recordings?.reload(selecting: nil)
-                statusLabel.stringValue = "保存せずにリセットしました"
+                setStatus("保存せずにリセットしました")
             }
         }
         resetting = false
@@ -783,7 +836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func noteDeferredTitle() {
         guard !running, !preparing else { return }
-        statusLabel.stringValue = deferredTitleStatus
+        setStatus(deferredTitleStatus)
     }
 
     private func presentPendingTitles() async {
@@ -792,6 +845,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             closeAfterTitle = false
             return
         }
+        guard !titleQueue.paths.isEmpty else { return }
         presentingTitle = true
         naming = true
         refreshStartButton()
@@ -810,7 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             await resolveTitle(for: URL(fileURLWithPath: path))
         }
         if !running, !preparing, statusLabel.stringValue == deferredTitleStatus {
-            statusLabel.stringValue = "保存しました"
+            setStatus("保存しました")
         }
     }
 
@@ -825,7 +879,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             recordings?.reload(selecting: renamed)
         } catch {
-            statusLabel.stringValue = "名前を付けられませんでした"
+            setStatus("名前を付けられませんでした")
         }
     }
 
@@ -1030,6 +1084,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             defer: false
         )
         window.title = "記録音"
+        window.isReleasedWhenClosed = false
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
@@ -2015,6 +2070,29 @@ final class StampButton: NSView {
         guard isEnabled else { return false }
         onPress()
         return true
+    }
+}
+
+enum MenuBarMark {
+    static let idle = image(template: true) { rect in
+        let path = NSBezierPath(ovalIn: rect.insetBy(dx: 3.3, dy: 3.3))
+        path.lineWidth = 1.6
+        NSColor.black.setStroke()
+        path.stroke()
+    }
+
+    static let recording = image(template: false) { rect in
+        Ink.seal.setFill()
+        NSBezierPath(ovalIn: rect.insetBy(dx: 2.5, dy: 2.5)).fill()
+    }
+
+    private static func image(template: Bool, _ draw: @escaping (NSRect) -> Void) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+            draw(rect)
+            return true
+        }
+        image.isTemplate = template
+        return image
     }
 }
 

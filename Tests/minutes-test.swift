@@ -25,10 +25,14 @@ private func checkSpoken() {
     # 16000 Hz モノラル
     [15:31:10] 自分 はい
     [15:31:12] 相手 今週の定例です
+    [15:31:40] 中村 光毅	来週までに送る
 
     """
-    expect(MinutesText.spoken(from: transcript), "[15:31:10] 自分 はい\n[15:31:12] 相手 今週の定例です")
+    expect(MinutesText.spoken(from: transcript), "自分 はい\n相手 今週の定例です\n中村 光毅\t来週までに送る")
     expect(MinutesText.spoken(from: "# 題 だけ\n"), "")
+    expect(MinutesText.spoken(from: "[0] 相手 発話\n[15:31:10]\n"), "[0] 相手 発話")
+    expect(MinutesText.responseTokenLimit(for: MinutesText.extractInstructions), MinutesText.extractResponseTokens)
+    expect(MinutesText.responseTokenLimit(for: "型"), MinutesText.outputReserve)
 }
 
 private func checkChunksKeepText() {
@@ -138,7 +142,9 @@ private func checkShortIsOneCall() async throws {
     )
     expect(outcome, MinutesOutcome(text: "議事録", outputCut: false, notesCut: false))
     expect(log.instructions, ["型"])
-    expect(log.users.first?.contains("[15:31:12] 相手 今週の定例です"), true)
+    expect(log.users.first?.contains("自分 はい"), true)
+    expect(log.users.first?.contains("相手 今週の定例です"), true)
+    expect(log.users.first?.contains("[15:31:"), false)
     expect(log.users.first?.contains("# 2026-10-27"), false)
 }
 

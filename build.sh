@@ -59,6 +59,7 @@ mkdir -p "$APP/Contents/MacOS"
   Sources/Transcribe.swift \
   Sources/Capture.swift \
   Sources/TitlePrompt.swift \
+  Sources/DisplayGate.swift \
   Sources/main.swift \
   -o "$APP/Contents/MacOS/LocalTranscription"
 mkdir -p "$APP/Contents/Resources"

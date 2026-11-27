@@ -24,6 +24,9 @@ final class UIHooks: @unchecked Sendable {
     var finish: @Sendable (URL, @escaping @Sendable () -> Void) -> Void = { _, done in done() }
     var sessionLines: @Sendable ([String]) -> Void = { _ in }
     var reveal: @Sendable () -> Void = {}
+    var holdDisplay: @Sendable () -> Void = {}
+    var releaseDisplay: @Sendable () -> Void = {}
+    var cancelDisplay: @Sendable () -> Void = {}
 }
 
 final class Router: @unchecked Sendable {
@@ -107,11 +110,13 @@ actor Engine {
         guard !active, !busy, !rotating, !awaitingTitle else { return }
         busy = true
         let token = generation
+        hooks.holdDisplay()
         hooks.preparing(true)
         hooks.permission(nil)
         defer {
             busy = false
             hooks.preparing(false)
+            hooks.cancelDisplay()
         }
         do {
             _ = try SessionStore.sessionsRoot(create: true)
@@ -133,7 +138,9 @@ actor Engine {
                 throw EngineError.formatUnavailable
             }
             fputs("認識の形式: \(format)\n", stderr)
-            try await startSession(locale: locale, format: format, token: token)
+            if try await startSession(locale: locale, format: format, token: token) {
+                hooks.releaseDisplay()
+            }
         } catch {
             hooks.running(false)
             hooks.status(error.localizedDescription)
@@ -172,7 +179,7 @@ actor Engine {
         return true
     }
 
-    private func startSession(locale: Locale, format: AVAudioFormat, token: Int) async throws {
+    private func startSession(locale: Locale, format: AVAudioFormat, token: Int) async throws -> Bool {
         let store = try SessionStore.create(format: format)
         let system = LiveChannel(speaker: .system, locale: locale, format: format)
         let microphone = LiveChannel(speaker: .microphone, locale: locale, format: format)
@@ -224,7 +231,7 @@ actor Engine {
             hooks.path(directory.path)
             hooks.running(false)
             await deliver(directory, status: "保存しました")
-            return
+            return false
         }
 
         active = true
@@ -233,6 +240,7 @@ actor Engine {
         startCaptions()
         hooks.status(runningStatus())
         armLimit()
+        return true
     }
 
     private func beginCapture(_ format: AVAudioFormat) async throws {
@@ -311,7 +319,7 @@ actor Engine {
             return
         }
         do {
-            try await startSession(locale: locale, format: format, token: token)
+            _ = try await startSession(locale: locale, format: format, token: token)
         } catch {
             hooks.running(false)
             hooks.status(error.localizedDescription)
@@ -521,13 +529,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 self.showMainWindow(nil)
             }
         }
-        hooks.line = { [weak self, displayGate] line in
-            let generation = displayGate.current()
-            Task { @MainActor in
-                guard let self, displayGate.current() == generation else { return }
-                self.appendLine(line)
+        let present: @Sendable (DisplayGate.Piece) -> Void = { [weak self, displayGate] piece in
+            switch displayGate.intake(piece) {
+            case .held:
+                return
+            case .show(let generation):
+                Task { @MainActor in
+                    guard let self, displayGate.current() == generation else { return }
+                    self.apply(piece)
+                }
             }
         }
+        hooks.line = { present(.line($0)) }
         hooks.sessionLines = { [weak self, displayGate] lines in
             let generation = displayGate.current()
             Task { @MainActor in
@@ -538,12 +551,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 }
             }
         }
-        hooks.volatile = { [weak self, displayGate] speaker, text in
-            let generation = displayGate.current()
+        hooks.volatile = { speaker, text in
+            present(speaker == .system ? .system(text) : .microphone(text))
+        }
+        hooks.holdDisplay = { [displayGate] in
+            displayGate.hold()
+        }
+        hooks.releaseDisplay = { [weak self, displayGate] in
+            guard let release = displayGate.release() else { return }
             Task { @MainActor in
-                guard let self, displayGate.current() == generation else { return }
-                self.setVolatile(speaker, text)
+                guard let self, displayGate.current() == release.generation else { return }
+                self.clearTranscript()
+                for piece in release.pending {
+                    self.apply(piece)
+                }
             }
+        }
+        hooks.cancelDisplay = { [displayGate] in
+            displayGate.cancel()
         }
         hooks.path = { [weak self] path in
             Task { @MainActor in
@@ -559,9 +584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 self?.refreshSideButton()
             }
         }
-        hooks.notice = { [weak self] text in
-            Task { @MainActor in self?.appendNotice(text) }
-        }
+        hooks.notice = { present(.notice($0)) }
         hooks.running = { [weak self] running in
             Task { @MainActor in
                 guard let self else { return }
@@ -993,6 +1016,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         field.attributedStringValue = line
     }
 
+    private func apply(_ piece: DisplayGate.Piece) {
+        switch piece {
+        case .line(let line):
+            appendLine(line)
+        case .system(let text):
+            setVolatile(.system, text)
+        case .microphone(let text):
+            setVolatile(.microphone, text)
+        case .notice(let text):
+            appendNotice(text)
+        }
+    }
+
     private func clearTranscript() {
         textView.string = ""
         setVolatile(.system, "")
@@ -1304,23 +1340,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 private enum TitleChoice {
     case name(String)
     case close
-}
-
-final class DisplayGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private var generation = 0
-
-    func current() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return generation
-    }
-
-    func bump() {
-        lock.lock()
-        generation += 1
-        lock.unlock()
-    }
 }
 
 @MainActor

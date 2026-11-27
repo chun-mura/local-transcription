@@ -5,7 +5,7 @@ import Foundation
 import ScreenCaptureKit
 
 final class SystemCapture: NSObject, SCStreamDelegate, SCStreamOutput, @unchecked Sendable {
-    var onBuffer: ((Speaker, AVAudioPCMBuffer) -> Void)?
+    var onBuffer: ((Speaker, AVAudioPCMBuffer?, CMTime, CMTime) -> Void)?
     var onStopped: ((String) -> Void)?
 
     private let audioQueue = DispatchQueue(label: "local-transcription.system")
@@ -86,10 +86,12 @@ final class SystemCapture: NSObject, SCStreamDelegate, SCStreamOutput, @unchecke
         let open = accepting
         flagLock.unlock()
         guard open, let input = AudioBuffers.pcmBuffer(from: sampleBuffer) else { return }
+        let start = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let duration = Self.duration(of: sampleBuffer, input: input)
         switch type {
         case .audio:
-            guard let output = systemConverter?.convert(input) else { return }
-            onBuffer?(.system, output)
+            let output = systemConverter?.convert(input)
+            onBuffer?(.system, output, start, duration)
         case .microphone:
             if !loggedMicrophoneFormat {
                 loggedMicrophoneFormat = true
@@ -101,11 +103,21 @@ final class SystemCapture: NSObject, SCStreamDelegate, SCStreamOutput, @unchecke
             if decimate {
                 microphoneConverter?.preferDecimation()
             }
-            guard let output = microphoneConverter?.convert(input) else { return }
-            onBuffer?(.microphone, output)
+            let output = microphoneConverter?.convert(input)
+            onBuffer?(.microphone, output, start, duration)
         default:
             break
         }
+    }
+
+    private static func duration(of sampleBuffer: CMSampleBuffer, input: AVAudioPCMBuffer) -> CMTime {
+        let duration = CMSampleBufferGetDuration(sampleBuffer)
+        if duration.isValid, !duration.isIndefinite, !duration.isNegativeInfinity, !duration.isPositiveInfinity, duration.seconds > 0 {
+            return duration
+        }
+        let rate = input.format.sampleRate
+        let seconds = rate > 0 ? Double(input.frameLength) / rate : 0
+        return CMTime(seconds: seconds, preferredTimescale: 1_000_000)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

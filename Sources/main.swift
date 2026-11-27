@@ -3,6 +3,7 @@ import ApplicationServices
 import AVFoundation
 import Carbon.HIToolbox
 import CoreGraphics
+import CoreMedia
 import Foundation
 import ScreenCaptureKit
 import Speech
@@ -51,13 +52,16 @@ final class Router: @unchecked Sendable {
         lock.unlock()
     }
 
-    func ingest(_ speaker: Speaker, _ buffer: AVAudioPCMBuffer) {
+    func ingest(_ speaker: Speaker, _ buffer: AVAudioPCMBuffer?, at time: CMTime, duration: CMTime) {
         lock.lock()
         let store = store
         let channel = speaker == .system ? system : microphone
         lock.unlock()
-        store?.write(speaker, buffer: buffer)
-        channel?.append(buffer)
+        if let buffer {
+            store?.write(speaker, buffer: buffer)
+            channel?.append(buffer)
+        }
+        store?.mix(speaker, buffer: buffer, at: time, duration: duration)
     }
 
     func appendTranscript(_ speaker: Speaker, text: String, at date: Date, start: Double, end: Double) -> String? {
@@ -283,8 +287,8 @@ actor Engine {
     }
 
     nonisolated func installHandlers() {
-        capture.onBuffer = { [router] speaker, buffer in
-            router.ingest(speaker, buffer)
+        capture.onBuffer = { [router] speaker, buffer, time, duration in
+            router.ingest(speaker, buffer, at: time, duration: duration)
         }
         capture.onStopped = { message in
             Task { await self.unexpectedStop(message) }

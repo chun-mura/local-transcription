@@ -56,6 +56,7 @@ Teams や Meet には絞っていない。そのディスプレイで鳴って�
 - `transcript.txt`
 - `audio-system.wav`（相手）
 - `audio-mic.wav`（自分）
+- `audio.wav`（相手と自分を、同じ時刻で重ねたモノラル）
 - `minutes.md`（議事録を作ったときだけ）
 
 `transcript.txt` の形:

@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreMedia
 import Foundation
 
 enum Speaker: String, Sendable {
@@ -53,12 +54,310 @@ struct TranscriptLine: Equatable {
     }
 }
 
+private struct MixChunk {
+    var speaker: Speaker
+    var startSecond: Double
+    var samples: [Float]
+}
+
+/// 相手と自分を、取り込み時刻を揃えたモノラルへ重ねる。
+final class ConversationMix {
+    private let format: AVAudioFormat
+    private let sampleRate: Double
+    private let lock = NSLock()
+    private var file: AVAudioFile?
+    private var origin: Double?
+    private var heardUntil: [Speaker: Double] = [:]
+    private var pending: [MixChunk] = []
+    private var committedFrames: Int64 = 0
+    private var closed = false
+    private var loggedLateDrop = false
+    private var loggedDistantClock = false
+    private var loggedWriteError = false
+    private let skewLimit = 20.0
+    private let originSlack = 30.0
+
+    init(url: URL, sampleRate: Double) throws {
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw SessionsRootError.unavailable
+        }
+        self.format = format
+        self.sampleRate = sampleRate
+        file = try AVAudioFile(
+            forWriting: url,
+            settings: format.settings,
+            commonFormat: format.commonFormat,
+            interleaved: format.isInterleaved
+        )
+    }
+
+    func add(speaker: Speaker, buffer: AVAudioPCMBuffer?, at time: CMTime, duration: CMTime) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        let samples = buffer.flatMap { Self.floats(from: $0) } ?? []
+        let bufferSpan = sampleRate > 0 ? Double(samples.count) / sampleRate : 0
+        let span = max(Self.positiveSeconds(duration) ?? 0, bufferSpan)
+        guard let start = timelineStart(speaker: speaker, time: time) else { return }
+        heardUntil[speaker] = max(heardUntil[speaker] ?? 0, start + span)
+        if !samples.isEmpty {
+            place(speaker: speaker, samples: samples, at: start)
+        }
+        flush(final: false)
+    }
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        closed = true
+        flush(final: true)
+        file = nil
+    }
+
+    private func timelineStart(speaker: Speaker, time: CMTime) -> Double? {
+        guard let seconds = Self.finiteSeconds(time) else {
+            return heardUntil[speaker] ?? 0
+        }
+        guard committedFrames == 0 else {
+            let start = seconds - (origin ?? seconds)
+            if start < -originSlack {
+                noteDistantClock()
+                return nil
+            }
+            return start
+        }
+        if let origin {
+            if seconds < origin {
+                let shift = origin - seconds
+                if shift > originSlack {
+                    noteDistantClock()
+                    return nil
+                }
+                self.origin = seconds
+                for index in pending.indices {
+                    pending[index].startSecond += shift
+                }
+                for key in heardUntil.keys {
+                    heardUntil[key]! += shift
+                }
+            }
+        } else {
+            origin = seconds
+        }
+        return seconds - (origin ?? seconds)
+    }
+
+    private func place(speaker: Speaker, samples: [Float], at start: Double) {
+        let startFrame = frame(start)
+        guard startFrame >= committedFrames else {
+            noteLateDrop()
+            let skip = Int(committedFrames - startFrame)
+            guard skip < samples.count else { return }
+            let kept = Array(samples[skip...])
+            let keptStart = sampleRate > 0 ? Double(committedFrames) / sampleRate : 0
+            pending.append(MixChunk(speaker: speaker, startSecond: keptStart, samples: kept))
+            return
+        }
+        pending.append(MixChunk(speaker: speaker, startSecond: start, samples: samples))
+    }
+
+    private func noteLateDrop() {
+        guard !loggedLateDrop else { return }
+        loggedLateDrop = true
+        fputs("確定済みの位置へ遅れて届いた音を捨てました\n", stderr)
+    }
+
+    private func noteDistantClock() {
+        guard !loggedDistantClock else { return }
+        loggedDistantClock = true
+        fputs("取り込み時刻が離れすぎているため、その音は重ねませんでした\n", stderr)
+    }
+
+    private func flush(final: Bool) {
+        let commitSeconds: Double
+        if final {
+            let heard = heardUntil.values.max() ?? 0
+            let pendingEnd = pending.reduce(into: 0.0) { end, chunk in
+                let span = sampleRate > 0 ? Double(chunk.samples.count) / sampleRate : 0
+                end = max(end, chunk.startSecond + span)
+            }
+            commitSeconds = max(heard, pendingEnd)
+        } else {
+            guard let system = heardUntil[.system], let microphone = heardUntil[.microphone] else { return }
+            let slow = min(system, microphone)
+            let fast = max(system, microphone)
+            commitSeconds = fast - slow > skewLimit ? fast - skewLimit : slow
+        }
+        let commitFrame = max(committedFrames, frame(commitSeconds))
+        var cursor = committedFrames
+        let step = Int64(max(sampleRate, 1).rounded())
+        while cursor < commitFrame {
+            let end = min(commitFrame, cursor + max(step, 1))
+            write(from: cursor, to: end)
+            cursor = end
+        }
+    }
+
+    private func write(from start: Int64, to end: Int64) {
+        let count = Int(end - start)
+        guard count > 0 else {
+            committedFrames = end
+            return
+        }
+        var system = [Float](repeating: 0, count: count)
+        var microphone = [Float](repeating: 0, count: count)
+        for chunk in pending {
+            let chunkStart = frame(chunk.startSecond)
+            let chunkEnd = chunkStart + Int64(chunk.samples.count)
+            let overlapStart = max(chunkStart, start)
+            let overlapEnd = min(chunkEnd, end)
+            guard overlapStart < overlapEnd else { continue }
+            let sourceIndex = Int(overlapStart - chunkStart)
+            let destIndex = Int(overlapStart - start)
+            let frames = Int(overlapEnd - overlapStart)
+            for offset in 0..<frames {
+                let source = sourceIndex + offset
+                let dest = destIndex + offset
+                guard source >= 0, source < chunk.samples.count, dest >= 0, dest < count else { continue }
+                if chunk.speaker == .system {
+                    system[dest] += chunk.samples[source]
+                } else {
+                    microphone[dest] += chunk.samples[source]
+                }
+            }
+        }
+        var mixed = [Float](repeating: 0, count: count)
+        for index in 0..<count {
+            let left = system[index]
+            let right = microphone[index]
+            let value: Float
+            if abs(left) > 0.01, abs(right) > 0.01 {
+                value = 0.5 * left + 0.5 * right
+            } else {
+                value = left + right
+            }
+            mixed[index] = min(1, max(-1, value))
+        }
+        write(mixed)
+        committedFrames = end
+        pending = pending.compactMap { chunk in
+            let chunkStart = frame(chunk.startSecond)
+            let chunkEnd = chunkStart + Int64(chunk.samples.count)
+            if chunkEnd <= end { return nil }
+            if chunkStart >= end { return chunk }
+            let skip = Int(end - chunkStart)
+            guard skip < chunk.samples.count else { return nil }
+            let kept = Array(chunk.samples[skip...])
+            let keptStart = sampleRate > 0 ? Double(end) / sampleRate : 0
+            return MixChunk(speaker: chunk.speaker, startSecond: keptStart, samples: kept)
+        }
+    }
+
+    private func write(_ samples: [Float]) {
+        guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
+              let destination = output.floatChannelData
+        else { return }
+        output.frameLength = AVAudioFrameCount(samples.count)
+        for index in 0..<samples.count {
+            destination[0][index] = samples[index]
+        }
+        do {
+            try file?.write(from: output)
+        } catch {
+            if !loggedWriteError {
+                loggedWriteError = true
+                fputs("会話のwavの書き込みに失敗しました: \(error)\n", stderr)
+            }
+        }
+    }
+
+    private func frame(_ seconds: Double) -> Int64 {
+        guard sampleRate > 0, seconds.isFinite else { return 0 }
+        return Int64((seconds * sampleRate).rounded())
+    }
+
+    private static func finiteSeconds(_ time: CMTime) -> Double? {
+        guard time.isValid, !time.isIndefinite, !time.isNegativeInfinity, !time.isPositiveInfinity else { return nil }
+        let seconds = time.seconds
+        guard seconds.isFinite else { return nil }
+        return seconds
+    }
+
+    private static func positiveSeconds(_ time: CMTime) -> Double? {
+        guard let seconds = finiteSeconds(time), seconds > 0 else { return nil }
+        return seconds
+    }
+
+    private static func floats(from buffer: AVAudioPCMBuffer) -> [Float] {
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return [] }
+        if buffer.format.commonFormat == .pcmFormatFloat32, let channels = buffer.floatChannelData {
+            return downmix(channels: channels, count: Int(buffer.format.channelCount), frames: frames)
+        }
+        guard let converted = convertToFloat(buffer), let channels = converted.floatChannelData else { return [] }
+        return downmix(channels: channels, count: Int(converted.format.channelCount), frames: Int(converted.frameLength))
+    }
+
+    private static func downmix(channels: UnsafePointer<UnsafeMutablePointer<Float>>, count: Int, frames: Int) -> [Float] {
+        guard count > 0, frames > 0 else { return [] }
+        var samples = [Float](repeating: 0, count: frames)
+        if count == 1 {
+            samples.withUnsafeMutableBufferPointer { destination in
+                guard let base = destination.baseAddress else { return }
+                base.update(from: channels[0], count: frames)
+            }
+            return samples
+        }
+        let scale = 1 / Float(count)
+        for index in 0..<frames {
+            var sum: Float = 0
+            for channel in 0..<count {
+                sum += channels[channel][index]
+            }
+            samples[index] = sum * scale
+        }
+        return samples
+    }
+
+    private static func convertToFloat(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: buffer.format.sampleRate,
+            channels: 1,
+            interleaved: false
+        ), let converter = AVAudioConverter(from: buffer.format, to: format) else { return nil }
+        let ratio = buffer.format.sampleRate > 0 ? format.sampleRate / buffer.format.sampleRate : 1
+        let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 32
+        guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: max(capacity, 1)) else { return nil }
+        var consumed = false
+        var error: NSError?
+        let status = converter.convert(to: output, error: &error) { _, outStatus in
+            if consumed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+        guard status != .error, error == nil, output.frameLength > 0 else { return nil }
+        return output
+    }
+}
+
 final class SessionStore: @unchecked Sendable {
     let directory: URL
     let transcriptURL: URL
     private let lock = NSLock()
     private var systemFile: AVAudioFile?
     private var microphoneFile: AVAudioFile?
+    private var conversation: ConversationMix?
     private var transcript: FileHandle?
     private let clock: DateFormatter
     private let header: String
@@ -77,6 +376,7 @@ final class SessionStore: @unchecked Sendable {
         self.clock = clock
         systemFile = try Self.makeFile(directory.appendingPathComponent("audio-system.wav"), format: format)
         microphoneFile = try Self.makeFile(directory.appendingPathComponent("audio-mic.wav"), format: format)
+        conversation = try ConversationMix(url: directory.appendingPathComponent("audio.wav"), sampleRate: format.sampleRate)
     }
 
     private static func makeFile(_ url: URL, format: AVAudioFormat) throws -> AVAudioFile {
@@ -130,6 +430,10 @@ final class SessionStore: @unchecked Sendable {
                 fputs("wavの書き込みに失敗しました: \(error)\n", stderr)
             }
         }
+    }
+
+    func mix(_ speaker: Speaker, buffer: AVAudioPCMBuffer?, at time: CMTime, duration: CMTime) {
+        conversation?.add(speaker: speaker, buffer: buffer, at: time, duration: duration)
     }
 
     @discardableResult
@@ -189,6 +493,8 @@ final class SessionStore: @unchecked Sendable {
         transcript = nil
         systemFile = nil
         microphoneFile = nil
+        conversation?.finish()
+        conversation = nil
     }
 
     func discard() {

@@ -47,6 +47,7 @@ mkdir -p "$APP/Contents/MacOS"
   -framework FoundationModels \
   -framework CoreMedia \
   -framework CoreGraphics \
+  -framework CoreAudio \
   -framework Carbon \
   -framework ApplicationServices \
   Sources/Convert.swift \
@@ -60,6 +61,8 @@ mkdir -p "$APP/Contents/MacOS"
   Sources/Capture.swift \
   Sources/TitlePrompt.swift \
   Sources/DisplayGate.swift \
+  Sources/CallWatch.swift \
+  Sources/CallDetect.swift \
   Sources/main.swift \
   -o "$APP/Contents/MacOS/LocalTranscription"
 mkdir -p "$APP/Contents/Resources"

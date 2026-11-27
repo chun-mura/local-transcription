@@ -106,8 +106,8 @@ actor Engine {
         }
     }
 
-    func start() async {
-        guard !active, !busy, !rotating, !awaitingTitle else { return }
+    func start() async -> Bool {
+        guard !active, !busy, !rotating, !awaitingTitle else { return false }
         busy = true
         let token = generation
         hooks.holdDisplay()
@@ -118,6 +118,7 @@ actor Engine {
             hooks.preparing(false)
             hooks.cancelDisplay()
         }
+        var started = false
         do {
             _ = try SessionStore.sessionsRoot(create: true)
             try await ensurePermissions()
@@ -140,6 +141,7 @@ actor Engine {
             fputs("認識の形式: \(format)\n", stderr)
             if try await startSession(locale: locale, format: format, token: token) {
                 hooks.releaseDisplay()
+                started = true
             }
         } catch {
             hooks.running(false)
@@ -156,6 +158,7 @@ actor Engine {
             }
             hooks.reveal()
         }
+        return started
     }
 
     func stop() async {
@@ -473,6 +476,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let deferredTitleStatus = "保存しました。名前は戻ってから付けます"
     private var statusItem: NSStatusItem?
     private var statusToggle: NSMenuItem?
+    private var callSettings = CallWatchSettings.off
+    private var callWatch = CallWatch()
+    private var callDetect: CallDetect?
+    private var autoStartedRecording = false
+    private var autoStartPending = false
+    private var callStatusText: String?
+    private var loggedCallDetail = ""
+    private var autoStartItem: NSMenuItem?
+    private var autoStopItem: NSMenuItem?
+    private var callPanel: NSPanel?
+    private var callPromptMessage: NSTextField?
+    private var callPromptDetail: NSTextField?
+    private var callPromptVisible = false
 
     override init() {
         let words = FrequentWordsStore()
@@ -494,6 +510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         installStatusItem()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        startCallDetect()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -590,6 +607,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 guard let self else { return }
                 self.running = running
                 self.seal.active = running
+                if running, self.autoStartPending {
+                    self.autoStartedRecording = true
+                    self.autoStartPending = false
+                } else if !running {
+                    self.autoStartedRecording = false
+                    self.autoStartPending = false
+                }
                 self.refreshStartButton()
                 self.recordings?.noteActivityChanged()
                 if !running {
@@ -669,9 +693,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         refreshStartButton()
+        refreshCallMenu()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender == callPanel {
+            return true
+        }
         if closingAfterStop {
             return true
         }
@@ -708,6 +736,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let location = NSMenuItem(title: "保存先", action: #selector(showSaveLocationMenu(_:)), keyEquivalent: "")
         location.target = self
         appMenu.addItem(location)
+        appMenu.addItem(.separator())
+        let autoStart = NSMenuItem(title: "通話を検知したら録音を始める", action: #selector(toggleCallAutoStart(_:)), keyEquivalent: "")
+        autoStart.target = self
+        appMenu.addItem(autoStart)
+        let autoStop = NSMenuItem(title: "通話が終わったら録音を止める", action: #selector(toggleCallAutoStop(_:)), keyEquivalent: "")
+        autoStop.target = self
+        appMenu.addItem(autoStop)
+        autoStartItem = autoStart
+        autoStopItem = autoStop
+        refreshCallMenu()
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         let appItem = NSMenuItem()
@@ -779,6 +817,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if menuItem.action == #selector(toggleRecording(_:)) {
             return recordingControl().enabled
         }
+        if menuItem.action == #selector(toggleCallAutoStop(_:)) {
+            return callSettings.autoStart
+        }
         return true
     }
 
@@ -788,9 +829,184 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if running {
                 await engine.stop()
             } else {
-                await engine.start()
+                _ = await engine.start()
             }
         }
+    }
+
+    private func startCallDetect() {
+        if let support = try? SessionsRoot.supportDirectory(create: true) {
+            callSettings = CallWatchSettings.load(from: CallWatchSettings.fileURL(in: support))
+        }
+        refreshCallMenu()
+        let detect = CallDetect()
+        detect.onObservation = { [weak self] observation in
+            Task { @MainActor in
+                self?.handleCall(observation)
+            }
+        }
+        detect.start()
+        callDetect = detect
+    }
+
+    private func handleCall(_ observation: CallObservation) {
+        let input = CallWatchInput(
+            now: Date(),
+            teams: observation.teams,
+            meet: observation.meet,
+            recording: running,
+            preparing: preparing,
+            naming: naming || presentingTitle,
+            resetting: resetting || askingReset,
+            autoStarted: autoStartedRecording,
+            settings: callSettings
+        )
+        for effect in callWatch.tick(input) {
+            switch effect {
+            case .showPrompt(let kind):
+                showCallPrompt(kind: kind, detail: observation.detail)
+            case .dismissPrompt:
+                hideCallPrompt()
+            case .startRecording:
+                autoStartPending = true
+                Task {
+                    let started = await engine.start()
+                    if !started {
+                        autoStartPending = false
+                    }
+                }
+            case .stopRecording:
+                autoStartedRecording = false
+                autoStartPending = false
+                Task { await engine.stop() }
+            }
+        }
+        noteCallDetail(observation.detail)
+    }
+
+    private func noteCallDetail(_ detail: String) {
+        if detail != loggedCallDetail {
+            loggedCallDetail = detail
+            if !detail.isEmpty {
+                fputs("通話の検知: \(detail)\n", stderr)
+            }
+        }
+        guard !running, !preparing else { return }
+        if !detail.isEmpty {
+            if statusLabel.stringValue == "停止中" || statusLabel.stringValue == callStatusText {
+                setStatus(detail.replacingOccurrences(of: "\n", with: " / "))
+                callStatusText = statusLabel.stringValue
+            }
+            return
+        }
+        if let callStatusText, statusLabel.stringValue == callStatusText {
+            setStatus("停止中")
+            self.callStatusText = nil
+        }
+    }
+
+    private func refreshCallMenu() {
+        autoStartItem?.state = callSettings.autoStart ? .on : .off
+        autoStopItem?.state = callSettings.autoStop ? .on : .off
+    }
+
+    private func saveCallSettings(_ settings: CallWatchSettings) -> Bool {
+        do {
+            let support = try SessionsRoot.supportDirectory(create: true)
+            try settings.save(to: CallWatchSettings.fileURL(in: support))
+            return true
+        } catch {
+            setStatus("通話の設定を置けません")
+            return false
+        }
+    }
+
+    @objc private func toggleCallAutoStart(_ sender: Any?) {
+        let next = callSettings.settingAutoStart(!callSettings.autoStart)
+        guard saveCallSettings(next) else { return }
+        callSettings = next
+        refreshCallMenu()
+    }
+
+    @objc private func toggleCallAutoStop(_ sender: Any?) {
+        guard callSettings.autoStart else { return }
+        let next = callSettings.settingAutoStop(!callSettings.autoStop)
+        guard saveCallSettings(next) else { return }
+        callSettings = next
+        refreshCallMenu()
+    }
+
+    private func showCallPrompt(kind: CallKind, detail: String) {
+        let panel = callPanel ?? makeCallPanel()
+        callPromptMessage?.stringValue = kind == .teams ? "Teams の通話を検知しました" : "Meet の通話を検知しました"
+        callPromptDetail?.stringValue = detail
+        if let screen = panel.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            let size = panel.frame.size
+            panel.setFrameOrigin(NSPoint(x: visible.maxX - size.width - 24, y: visible.maxY - size.height - 24))
+        }
+        callPromptVisible = true
+        panel.orderFrontRegardless()
+    }
+
+    private func hideCallPrompt() {
+        callPromptVisible = false
+        callPanel?.orderOut(nil)
+    }
+
+    private func makeCallPanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 150),
+            styleMask: [.titled, .closable, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "記録音"
+        panel.level = .statusBar
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+        let message = NSTextField(labelWithString: "通話を検知しました")
+        message.frame = NSRect(x: 20, y: 98, width: 340, height: 22)
+        message.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        let detail = NSTextField(wrappingLabelWithString: "")
+        detail.frame = NSRect(x: 20, y: 52, width: 340, height: 42)
+        detail.font = NSFont.systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        detail.maximumNumberOfLines = 2
+        let record = NSButton(title: "録音する", target: self, action: #selector(acceptCallPrompt(_:)))
+        record.frame = NSRect(x: 20, y: 16, width: 110, height: 28)
+        record.bezelStyle = .rounded
+        let skip = NSButton(title: "今はしない", target: self, action: #selector(declineCallPrompt(_:)))
+        skip.frame = NSRect(x: 140, y: 16, width: 110, height: 28)
+        skip.bezelStyle = .rounded
+        panel.contentView?.addSubview(message)
+        panel.contentView?.addSubview(detail)
+        panel.contentView?.addSubview(record)
+        panel.contentView?.addSubview(skip)
+        callPromptMessage = message
+        callPromptDetail = detail
+        callPanel = panel
+        return panel
+    }
+
+    @objc private func acceptCallPrompt(_ sender: Any?) {
+        guard !naming, !resetting, !askingReset, !preparing, !running else { return }
+        hideCallPrompt()
+        callWatch.notePromptClosed()
+        pressStart()
+    }
+
+    @objc private func declineCallPrompt(_ sender: Any?) {
+        hideCallPrompt()
+        callWatch.decline()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window == callPanel, callPromptVisible else { return }
+        callPromptVisible = false
+        callWatch.decline()
     }
 
     private func pressReset() {

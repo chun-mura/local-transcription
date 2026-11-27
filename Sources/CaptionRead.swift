@@ -18,6 +18,39 @@ struct SpeakerMark: Equatable {
     var name: String
 }
 
+enum CaptionWindow {
+    static func shouldRead(bundle: String, title: String, document: String) -> Bool {
+        switch bundle {
+        case "com.google.Chrome":
+            return title.contains("Meet") || document.contains("meet.google.com")
+        case "com.microsoft.teams2":
+            return !isTeamsShell(title)
+        default:
+            return false
+        }
+    }
+
+    private static func isTeamsShell(_ title: String) -> Bool {
+        let head = title.split(separator: "|", maxSplits: 1).first
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        if head.isEmpty { return true }
+        let shells: Set<String> = [
+            "Activity", "アクティビティ",
+            "Admin", "管理者",
+            "Apps", "アプリ",
+            "Calendar", "カレンダー", "予定表",
+            "Calls", "通話",
+            "Chat", "チャット",
+            "Copilot",
+            "Files", "ファイル",
+            "OneDrive",
+            "Store", "ストア",
+            "Teams", "Microsoft Teams",
+        ]
+        return shells.contains(head)
+    }
+}
+
 enum CaptionRead {
     static func sample(in windows: [CaptionNode]) -> CaptionSample {
         var speaker: String?

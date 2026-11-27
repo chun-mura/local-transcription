@@ -7,6 +7,7 @@ enum SpeakerTest {
         checkTeams()
         checkAssign()
         checkLine()
+        checkWindow()
     }
 }
 
@@ -72,6 +73,20 @@ private func checkAssign() {
     expect(SpeakerAssign.remoteLabel(start: 1.2, end: 4, marks: marks, localNames: ["あなた"], until: 12), nil)
     expect(SpeakerAssign.remoteLabel(start: 0, end: 0.8, marks: marks, localNames: ["あなた"], until: 12), nil)
     expect(SpeakerAssign.remoteLabel(start: 9.2, end: 11, marks: marks, localNames: ["あなた"], until: 12), nil)
+}
+
+private func checkWindow() {
+    let teams = "com.microsoft.teams2"
+    let chrome = "com.google.Chrome"
+    let org = " | 株式会社Life Work Technologies | k.nakamura@lwt.co.jp"
+    expect(CaptionWindow.shouldRead(bundle: teams, title: "井上さんの契約周りの確認+α" + org, document: ""), true)
+    expect(CaptionWindow.shouldRead(bundle: teams, title: "中村 光毅 との会議" + org, document: ""), true)
+    expect(CaptionWindow.shouldRead(bundle: teams, title: "たけちゃん との通話" + org, document: ""), true)
+    expect(CaptionWindow.shouldRead(bundle: teams, title: "Calendar" + org, document: ""), false)
+    expect(CaptionWindow.shouldRead(bundle: teams, title: "チャット" + org, document: ""), false)
+    expect(CaptionWindow.shouldRead(bundle: chrome, title: "受信トレイ", document: ""), false)
+    expect(CaptionWindow.shouldRead(bundle: chrome, title: "Meet - abc-defg-hij", document: ""), true)
+    expect(CaptionWindow.shouldRead(bundle: chrome, title: "定例", document: "https://meet.google.com/abc-defg-hij"), true)
 }
 
 private func checkLine() {

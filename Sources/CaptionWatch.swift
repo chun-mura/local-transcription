@@ -81,18 +81,12 @@ final class CaptionWatch: @unchecked Sendable {
             for window in elements(axApp, kAXWindowsAttribute) {
                 let title = stringAttr(window, kAXTitleAttribute)
                 let document = stringAttr(window, "AXDocument")
-                guard shouldWalk(title: title, document: document) else { continue }
+                guard CaptionWindow.shouldRead(bundle: bundle, title: title, document: document) else { continue }
                 var count = 0
                 nodes.append(node(window, depth: 0, count: &count))
             }
         }
         return nodes
-    }
-
-    private func shouldWalk(title: String, document: String) -> Bool {
-        if title.contains("Meet") || document.contains("meet.google.com") { return true }
-        if title.contains("会議") { return true }
-        return false
     }
 
     private func node(_ element: AXUIElement, depth: Int, count: inout Int) -> CaptionNode {

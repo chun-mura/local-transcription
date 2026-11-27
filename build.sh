@@ -39,7 +39,20 @@ fi
 APP="dist/LocalTranscription.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
+
+# GenerationOptions の引数名は SDK で違う。macOS 27 SDK だけ samplingMode を持つ。
+SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
+FM_DIR="$SDK_PATH/System/Library/Frameworks/FoundationModels.framework/Versions/A/Modules/FoundationModels.swiftmodule"
+SWIFT_FLAGS=()
+if [[ -d "$FM_DIR" ]] && grep -q 'public init(samplingMode:' "$FM_DIR"/*.swiftinterface; then
+  SWIFT_FLAGS+=(-D GENERATION_OPTIONS_SAMPLING_MODE)
+  echo "GenerationOptions: samplingMode"
+else
+  echo "GenerationOptions: sampling"
+fi
+
 "$SWIFTC" -parse-as-library -O -target arm64-apple-macos26.0 \
+  "${SWIFT_FLAGS[@]}" \
   -framework AppKit \
   -framework AVFoundation \
   -framework ScreenCaptureKit \

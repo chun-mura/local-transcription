@@ -402,14 +402,20 @@ enum AppleMinutes {
             instructions: instructions,
             inputBudget: budget,
             generate: { guide, user in
-                let options = GenerationOptions(
-                    samplingMode: .greedy,
-                    maximumResponseTokens: MinutesText.responseTokenLimit(for: guide)
-                )
+                let options = generationOptions(maximumResponseTokens: MinutesText.responseTokenLimit(for: guide))
                 return try await complete(model: model, instructions: guide, user: user, options: options)
             },
             progress: progress
         )
+    }
+
+    // macOS 27 SDK は samplingMode。macOS 26 SDK には sampling しかない。build.sh が SDK を見てフラグを付ける。
+    private static func generationOptions(maximumResponseTokens: Int) -> GenerationOptions {
+        #if GENERATION_OPTIONS_SAMPLING_MODE
+        GenerationOptions(samplingMode: .greedy, maximumResponseTokens: maximumResponseTokens)
+        #else
+        GenerationOptions(sampling: .greedy, maximumResponseTokens: maximumResponseTokens)
+        #endif
     }
 
     private static func instructionLength(_ text: String, model: SystemLanguageModel) async -> Int {
